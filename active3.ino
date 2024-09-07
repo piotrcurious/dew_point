@@ -175,6 +175,7 @@ float fitPolynomialCurve(float *x, float *y, int n) {
 }
 
 // Monte Carlo simulation to find matching hypothetical curves
+void monteCarloSimulation(float *empiricalTemperatures, float *empiricalDewPoints, int n) {
 // Initialize with a high value to find the minimum error
   float bestMatchError = 1e6;
   float bestCO2 = 0;
