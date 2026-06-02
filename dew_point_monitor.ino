@@ -173,9 +173,10 @@ void controlCoolingPWM(float targetTemperature) {
     if (fabsf(currentTemp - targetTemperature) < 0.1f) break;
 
     // FIX 4: Use mapFloat() — Arduino map() is integer-only.
+    // If currentTemp > targetTemperature, we need MORE cooling (higher PWM).
     int pwmValue = (int)mapFloat(currentTemp,
-                                 targetTemperature - 5.0f, targetTemperature + 5.0f,
-                                 (float)maxPWM, (float)minPWM);
+                                 targetTemperature, targetTemperature + 5.0f,
+                                 (float)minPWM, (float)maxPWM);
     analogWrite(coolerPin, constrain(pwmValue, minPWM, maxPWM));
     delay(200);
   }
@@ -373,15 +374,12 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalDPs, int n) {
   }
 
   Serial.println("\n=== Monte Carlo Results ===");
-  Serial.print("Best CO2 deviation: ");
-  Serial.print((bestCO2 - 1.0f) * 100.0f, 2);
-  Serial.println(" %");
-  Serial.print("Best SO2 deviation: ");
-  Serial.print((bestSO2 - 1.0f) * 100.0f, 2);
-  Serial.println(" %");
-  Serial.print("Best NO2 deviation: ");
-  Serial.print((bestNO2 - 1.0f) * 100.0f, 2);
-  Serial.println(" %");
+  Serial.print("Best CO2 factor: ");
+  Serial.println(bestCO2, 3);
+  Serial.print("Best SO2 factor: ");
+  Serial.println(bestSO2, 3);
+  Serial.print("Best NO2 factor: ");
+  Serial.println(bestNO2, 3);
   Serial.print("RMSE: ");
   Serial.print(bestError, 4);
   Serial.println(" °C");
