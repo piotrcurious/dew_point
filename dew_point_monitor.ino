@@ -26,14 +26,16 @@ const int   coolerPin         = 9;
 const int   heaterPin         = 8;        // Reserved for external heater
 const int   maxPWM            = 255;
 const int   minPWM            = 50;
-const int   totalDataPoints   = 19;
+const int   totalDataPoints   = 32;
 
-// FIX 3: Safety timeout for the cooling control loop (2 minutes).
-const unsigned long coolingTimeoutMs = 120000UL;
+// FIX 3: Safety timeout for the cooling control loop (5 minutes).
+const unsigned long coolingTimeoutMs = 300000UL;
 
 // ── Empirical data storage ───────────────────────────────────────────────────
 float empiricalDewPoints[totalDataPoints];
 float empiricalTemperatures[totalDataPoints];
+float empiricalHumidities[totalDataPoints];
+float empiricalPressures[totalDataPoints];
 int   dataPointIndex = 0;
 
 // ── Function prototypes ───────────────────────────────────────────────────────
@@ -56,7 +58,7 @@ void  createCoolingProfile(float estimatedDewPoint);
 void  verifyDewPointWithHeatingProfile();
 float computeRMSE(float *simulated, float *empirical, int n);
 float fitPolynomialCurve(float *x, float *y, int n);
-void  monteCarloSimulation(float *empiricalTemps, float *empiricalDPs, int n);
+void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, float *empiricalDPs, int n);
 
 // ── setup() ──────────────────────────────────────────────────────────────────
 void setup() {
@@ -68,7 +70,7 @@ void setup() {
   verifyDewPointWithHeatingProfile();
 
   if (dataPointIndex > 1) {
-    monteCarloSimulation(empiricalTemperatures, empiricalDewPoints, dataPointIndex);
+    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, empiricalDewPoints, dataPointIndex);
   } else {
     Serial.println("Insufficient data points for Monte Carlo simulation.");
   }
@@ -156,27 +158,52 @@ void stopCooling() {
   analogWrite(coolerPin, 0);
 }
 
-// ── Adaptive cooling with feedback ──────────────────────────────────────────
-void controlCoolingPWM(float targetTemperature) {
-  analogWrite(coolerPin, maxPWM);
+// ── PID Control constants ────────────────────────────────────────────────────
+const float Kp = 120.0f;
+const float Ki = 2.5f;
+const float Kd = 15.0f;
+const float dt = 0.2f;  // 200ms loop interval
 
-  // FIX 3: Safety timeout — exit if target unreachable within 2 minutes.
+// ── Adaptive cooling with feedback (PID Controller) ──────────────────────────
+void controlCoolingPWM(float targetTemperature) {
+  float integral = 0.0f;
   unsigned long startMs = millis();
+  unsigned long lastMs = startMs;
+  float currentTemp = bme.readTemperature();
+  float lastError = currentTemp - targetTemperature;
 
   while (true) {
-    if (millis() - startMs > coolingTimeoutMs) {
+    unsigned long now = millis();
+    if (now - startMs > coolingTimeoutMs) {
       Serial.println("WARNING: Cooling timeout — target temperature not reached.");
       break;
     }
 
-    float currentTemp = bme.readTemperature();
-    if (fabsf(currentTemp - targetTemperature) < 0.1f) break;
+    float dtReal = (float)(now - lastMs) / 1000.0f;
+    if (dtReal < 0.001f) dtReal = 0.001f;
+    lastMs = now;
 
-    // FIX 4: Use mapFloat() — Arduino map() is integer-only.
-    // If currentTemp > targetTemperature, we need MORE cooling (higher PWM).
-    int pwmValue = (int)mapFloat(currentTemp,
-                                 targetTemperature, targetTemperature + 5.0f,
-                                 (float)minPWM, (float)maxPWM);
+    currentTemp = bme.readTemperature();
+    float error = currentTemp - targetTemperature;
+
+    if (fabsf(error) < 0.1f) break;
+
+    // Proportional term
+    float P = Kp * error;
+
+    // Integral term (with anti-windup)
+    if (fabsf(error) < 2.0f) {
+      integral += error * dtReal;
+    } else {
+      integral = 0.0f;
+    }
+    float I = Ki * integral;
+
+    // Derivative term
+    float D = Kd * (error - lastError) / dtReal;
+    lastError = error;
+
+    int pwmValue = (int)(P + I + D);
     analogWrite(coolerPin, constrain(pwmValue, minPWM, maxPWM));
     delay(200);
   }
@@ -209,6 +236,8 @@ void createCoolingProfile(float estimatedDewPoint) {
     dp = adjustDewPointForPressure(dp, pressure);
 
     empiricalTemperatures[dataPointIndex] = temp;
+    empiricalHumidities[dataPointIndex]   = humidity;
+    empiricalPressures[dataPointIndex]    = pressure;
     empiricalDewPoints[dataPointIndex]    = dp;
     dataPointIndex++;
 
@@ -246,6 +275,18 @@ void verifyDewPointWithHeatingProfile() {
     float t = tempEvent.temperature;
     float h = humEvent.relative_humidity;
     heatingDewPoints[i] = calculateDewPoint(t, h);
+
+    if (dataPointIndex < totalDataPoints) {
+      sensors_event_t pressEvent;
+      bme.readPressure(); // Dummy read if needed or use a real one
+      float p = bme.readPressure() / 100.0f;
+
+      empiricalTemperatures[dataPointIndex] = t;
+      empiricalHumidities[dataPointIndex]   = h;
+      empiricalPressures[dataPointIndex]    = p;
+      empiricalDewPoints[dataPointIndex]    = heatingDewPoints[i];
+      dataPointIndex++;
+    }
 
     Serial.print("Heating [");
     Serial.print(i + 1);   Serial.print("/"); Serial.print(heatingDataPoints);
@@ -329,8 +370,8 @@ float fitPolynomialCurve(float *x, float *y, int n) {
   return totalError;
 }
 
-// ── Monte Carlo contaminant search ───────────────────────────────────────────
-void monteCarloSimulation(float *empiricalTemps, float *empiricalDPs, int n) {
+// ── Monte Carlo contaminant search (Two-pass) ────────────────────────────────
+void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, float *empiricalDPs, int n) {
   if (n == 0) return;
 
   float bestError = 1e6f;
@@ -338,49 +379,49 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalDPs, int n) {
   float bestSO2   = 1.0f;
   float bestNO2   = 1.0f;
 
-  // FIX 8a: Cache ambient humidity once before the loops.
-  // The original code called bme.readHumidity() on every inner iteration —
-  // with step 0.002 that means 100^3 = 1 000 000 I²C sensor reads, which is
-  // completely impractical on an Arduino.
-  float cachedHumidity = bme.readHumidity();
-
-  // FIX 8b: Step size widened from 0.002 to 0.01 → 21 steps per dimension →
-  // ~9 261 total iterations, feasible in a few seconds on an Arduino.
-  // Reduce further to 0.02 (11 steps/dim, ~1 331 iter) if speed is critical.
-  for (float co2Dev = 0.9f; co2Dev <= 1.101f; co2Dev += 0.01f) {
-    for (float so2Dev = 0.9f; so2Dev <= 1.101f; so2Dev += 0.01f) {
-      for (float no2Dev = 0.9f; no2Dev <= 1.101f; no2Dev += 0.01f) {
-
-        // FIX 8c: Replaced the C99 VLA float simulatedDewPoints[n] with a
-        // fixed-size array — VLAs are not guaranteed in Arduino C++.
+  // Pass 1: Coarse search
+  for (float co2 = 0.8f; co2 <= 1.201f; co2 += 0.05f) {
+    for (float so2 = 0.8f; so2 <= 1.201f; so2 += 0.05f) {
+      for (float no2 = 0.8f; no2 <= 1.201f; no2 += 0.05f) {
         float simDP[totalDataPoints];
         for (int j = 0; j < n; j++) {
-          float baseDP = calculateDewPoint(empiricalTemps[j], cachedHumidity);
-          simDP[j] = adjustDewPointForContaminants(baseDP, co2Dev, so2Dev, no2Dev);
+          float baseDP = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
+          baseDP = adjustDewPointForPressure(baseDP, empiricalPressures[j]);
+          simDP[j] = adjustDewPointForContaminants(baseDP, co2, so2, no2);
         }
-
-        // FIX 9: Compare simulated DPs against *empirical* DPs via RMSE.
-        // The original compared simulated data against itself (wrong metric).
         float err = computeRMSE(simDP, empiricalDPs, n);
-
         if (err < bestError) {
-          bestError = err;
-          bestCO2   = co2Dev;
-          bestSO2   = so2Dev;
-          bestNO2   = no2Dev;
+          bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
+        }
+      }
+    }
+  }
+
+  // Pass 2: Fine search around the best coarse result
+  float startCO2 = bestCO2 - 0.04f;
+  float startSO2 = bestSO2 - 0.04f;
+  float startNO2 = bestNO2 - 0.04f;
+
+  for (float co2 = startCO2; co2 <= startCO2 + 0.081f; co2 += 0.01f) {
+    for (float so2 = startSO2; so2 <= startSO2 + 0.081f; so2 += 0.01f) {
+      for (float no2 = startNO2; no2 <= startNO2 + 0.081f; no2 += 0.01f) {
+        float simDP[totalDataPoints];
+        for (int j = 0; j < n; j++) {
+          float baseDP = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
+          baseDP = adjustDewPointForPressure(baseDP, empiricalPressures[j]);
+          simDP[j] = adjustDewPointForContaminants(baseDP, co2, so2, no2);
+        }
+        float err = computeRMSE(simDP, empiricalDPs, n);
+        if (err < bestError) {
+          bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
       }
     }
   }
 
   Serial.println("\n=== Monte Carlo Results ===");
-  Serial.print("Best CO2 factor: ");
-  Serial.println(bestCO2, 3);
-  Serial.print("Best SO2 factor: ");
-  Serial.println(bestSO2, 3);
-  Serial.print("Best NO2 factor: ");
-  Serial.println(bestNO2, 3);
-  Serial.print("RMSE: ");
-  Serial.print(bestError, 4);
-  Serial.println(" °C");
+  Serial.print("Best CO2 factor: "); Serial.println(bestCO2, 3);
+  Serial.print("Best SO2 factor: "); Serial.println(bestSO2, 3);
+  Serial.print("Best NO2 factor: "); Serial.println(bestNO2, 3);
+  Serial.print("RMSE: ");            Serial.print(bestError, 4); Serial.println(" °C");
 }

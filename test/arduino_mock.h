@@ -9,6 +9,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <random>
 
 // --- Arduino Constants ---
 #define HIGH 0x1
@@ -46,6 +47,9 @@ struct MockState {
     float true_co2_factor = 1.05f;
     float true_so2_factor = 1.02f;
     float true_no2_factor = 1.03f;
+
+    std::mt19937 gen{42};
+    std::normal_distribution<float> noise{0.0f, 0.02f};
 };
 extern MockState g_mock;
 
@@ -54,14 +58,18 @@ inline void delay(unsigned long ms) {
     g_mock.mock_millis += ms;
 
     float ambient = 25.0f;
-    int steps = ms / 100;
+    int steps = ms / 10; // Finer simulation steps
     if (steps == 0) steps = 1;
     float dt = (float)ms / steps / 1000.0f; // in seconds
 
     for(int i=0; i<steps; ++i) {
-        float cooling = (g_mock.cooler_pwm / 255.0f) * 0.5f; // 0.5 deg/sec max
-        float warming = 0.05f * (ambient - g_mock.bme_temp);
-        g_mock.bme_temp += (warming - cooling) * dt;
+        // More realistic cooling: Peltier efficiency drops as deltaT increases
+        float deltaT = g_mock.bme_temp - ambient;
+        float cooling_power = (g_mock.cooler_pwm / 255.0f) * 2.0f;
+        float heat_leak = 0.1f * (ambient - g_mock.bme_temp);
+
+        // Simplified thermal mass: dT = (Power / Mass) * dt
+        g_mock.bme_temp += (heat_leak - cooling_power) * dt;
     }
 }
 
@@ -108,7 +116,9 @@ struct sensors_event_t {
 class Adafruit_BME280 {
 public:
     bool begin(uint8_t addr) { return true; }
-    float readTemperature() { return g_mock.bme_temp; }
+    float readTemperature() {
+        return g_mock.bme_temp + g_mock.noise(g_mock.gen);
+    }
     float readHumidity() {
         float base_dp = mock_calculateDewPoint(g_mock.bme_temp, g_mock.bme_hum);
 
@@ -124,11 +134,10 @@ public:
         float alpha_dp = (A * affected_dp) / (B + affected_dp);
         float alpha_t = (A * g_mock.bme_temp) / (B + g_mock.bme_temp);
 
-        // Ensure alpha_dp - alpha_t is not too large
         float rh = 100.0f * expf(alpha_dp - alpha_t);
         if (rh > 100.0f) rh = 100.0f;
 
-        return rh;
+        return rh + g_mock.noise(g_mock.gen);
     }
     float readPressure() { return g_mock.bme_press; }
 };
@@ -144,8 +153,8 @@ public:
         }
     }
     void getEvent(sensors_event_t* humidity, sensors_event_t* temp) {
-        temp->temperature = g_mock.sht_temp;
-        humidity->relative_humidity = g_mock.sht_hum;
+        temp->temperature = g_mock.sht_temp + g_mock.noise(g_mock.gen);
+        humidity->relative_humidity = g_mock.sht_hum + g_mock.noise(g_mock.gen);
         g_mock.sht_temp -= 0.01f;
         if (g_mock.sht_temp < 25.0f) g_mock.sht_temp = 25.0f;
     }
