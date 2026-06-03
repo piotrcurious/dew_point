@@ -3,6 +3,9 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_SHT4x.h>
 #include <math.h>
+#include <string.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
 
 // ── Sensor instances ─────────────────────────────────────────────────────────
 Adafruit_BME280 bme;
@@ -26,17 +29,97 @@ const int   coolerPin         = 9;
 const int   heaterPin         = 8;        // Reserved for external heater
 const int   maxPWM            = 255;
 const int   minPWM            = 50;
-const int   totalDataPoints   = 32;
+const int   numCoolingPoints  = 100;
+const int   numHeatingPoints  = 50;
+const int   totalDataPoints   = 500; // Large buffer for RT monitoring
 
 // FIX 3: Safety timeout for the cooling control loop (5 minutes).
 const unsigned long coolingTimeoutMs = 300000UL;
 
-// ── Empirical data storage ───────────────────────────────────────────────────
+// ── Global factors (refined over time) ───────────────────────────────────────
+float currentCO2Factor = 1.0f;
+float currentSO2Factor = 1.0f;
+float currentNO2Factor = 1.0f;
+SemaphoreHandle_t factorMutex;
+
+// ── Empirical data storage (Circular buffer for real-time monitoring) ────────
 float empiricalDewPoints[totalDataPoints];
 float empiricalTemperatures[totalDataPoints];
 float empiricalHumidities[totalDataPoints];
 float empiricalPressures[totalDataPoints];
 int   dataPointIndex = 0;
+bool  bufferFull = false;
+SemaphoreHandle_t dataMutex;
+
+// ── Web Server & WebSockets ──────────────────────────────────────────────────
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+const char* htmlContent = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dew Point Monitor</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
+        #info { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>Dew Point Monitor</h1>
+        <div id="stats">Connecting...</div>
+    </div>
+    <script>
+        let scene = new THREE.Scene();
+        let camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        let renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        let geometry = new THREE.BufferGeometry();
+        let pointsCount = 500;
+        let positions = new Float32Array(pointsCount * 3);
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        let material = new THREE.PointsMaterial({ color: 0x00aaff, size: 0.5 });
+        let points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        camera.position.z = 50;
+
+        let gateway = `ws://${window.location.hostname}/ws`;
+        let websocket;
+        function initWebSocket() {
+            websocket = new WebSocket(gateway);
+            websocket.onmessage = onMessage;
+        }
+        function onMessage(event) {
+            let data = JSON.parse(event.data);
+            document.getElementById('stats').innerHTML =
+                `DP: ${data.dp.toFixed(2)} &deg;C | CorrDP: ${data.cdp.toFixed(2)} &deg;C<br>` +
+                `CO2: ${data.co2.toFixed(3)} | SO2: ${data.so2.toFixed(3)} | NO2: ${data.no2.toFixed(3)}`;
+
+            // Update WebGL visualization (scroll points)
+            for (let i = 0; i < pointsCount - 1; i++) {
+                positions[i * 3 + 1] = positions[(i + 1) * 3 + 1];
+                positions[i * 3 + 0] = (i / 10.0) - 25.0;
+            }
+            positions[(pointsCount - 1) * 3 + 1] = data.cdp - 15; // Offset for view
+            positions[(pointsCount - 1) * 3 + 0] = ((pointsCount - 1) / 10.0) - 25.0;
+            geometry.attributes.position.needsUpdate = true;
+        }
+        window.onload = initWebSocket;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
+)rawliteral";
 
 // ── Function prototypes ───────────────────────────────────────────────────────
 // FIX 6: Added missing prototypes for initializeSensors() and
@@ -47,37 +130,125 @@ void  initializeSensors();
 float estimateInitialDewPoint();
 float calculateDewPoint(float temperature, float humidity);
 float adjustDewPointForPressure(float dewPoint, float pressure);
-float adjustDewPointForCO2(float dewPoint, float concentration);
-float adjustDewPointForSO2(float dewPoint, float concentration);
-float adjustDewPointForNO2(float dewPoint, float concentration);
-float adjustDewPointForContaminants(float dewPoint, float co2Dev, float so2Dev, float no2Dev);
+float getTempAdsorptionFactor(float temperature);
+float adjustDewPointForCO2(float dewPoint, float concentration, float temperature);
+float adjustDewPointForSO2(float dewPoint, float concentration, float temperature);
+float adjustDewPointForNO2(float dewPoint, float concentration, float temperature);
+float adjustDewPointForContaminants(float dewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature);
 float mapFloat(float x, float inMin, float inMax, float outMin, float outMax);
 void  stopCooling();
 void  controlCoolingPWM(float targetTemperature);
-void  createCoolingProfile(float estimatedDewPoint);
+void  createCoolingProfile(float estimatedDewPoint, int numPoints);
 void  verifyDewPointWithHeatingProfile();
 float computeRMSE(float *simulated, float *empirical, int n);
 float fitPolynomialCurve(float *x, float *y, int n);
-void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, float *empiricalDPs, int n);
+float computeVariance(float *data, int n);
+float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature);
+void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n);
+void  addRealTimeDataPoint(float t, float h, float p, float dp);
+void  monteCarloTask(void *parameter);
+
+// ── Web Handlers ─────────────────────────────────────────────────────────────
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+  // Handle WS events if needed
+}
 
 // ── setup() ──────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   initializeSensors();
 
+  // WiFi Setup (using stubs in mock)
+  WiFi.begin("SSID", "PASS");
+
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", htmlContent);
+  });
+  server.begin();
+
+  dataMutex = xSemaphoreCreateMutex();
+  factorMutex = xSemaphoreCreateMutex();
+
+  Serial.println("Starting initial calibration profile...");
   float estimatedDewPoint = estimateInitialDewPoint();
-  createCoolingProfile(estimatedDewPoint);
+  createCoolingProfile(estimatedDewPoint, numCoolingPoints);
   verifyDewPointWithHeatingProfile();
 
   if (dataPointIndex > 1) {
-    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, empiricalDewPoints, dataPointIndex);
-  } else {
-    Serial.println("Insufficient data points for Monte Carlo simulation.");
+    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex);
+    bufferFull = true;
   }
+
+  // Start the background refinement task on Core 1
+  xTaskCreatePinnedToCore(monteCarloTask, "MCTask", 10000, NULL, 1, NULL, 1);
 }
 
 void loop() {
-  delay(5000);
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 100.0f;
+  float dp = calculateDewPoint(t, h);
+  dp = adjustDewPointForPressure(dp, p);
+
+  addRealTimeDataPoint(t, h, p, dp);
+
+  float cCO2, cSO2, cNO2;
+  xSemaphoreTake(factorMutex, portMAX_DELAY);
+  cCO2 = currentCO2Factor; cSO2 = currentSO2Factor; cNO2 = currentNO2Factor;
+  xSemaphoreGive(factorMutex);
+
+  float correctedDP = removeContaminantEffect(dp, cCO2, cSO2, cNO2, t);
+
+  Serial.print("RT [DP="); Serial.print(dp, 2);
+  Serial.print(" CorrDP="); Serial.print(correctedDP, 2);
+  Serial.print(" CO2="); Serial.print(cCO2, 2);
+  Serial.println("]");
+
+  // Send data to WebSockets
+  char json[128];
+  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f}",
+           dp, correctedDP, cCO2, cSO2, cNO2);
+  ws.textAll(json);
+
+  delay(2000);
+}
+
+// Task local static buffers to avoid stack smashing with large totalDataPoints
+float copyTemps[totalDataPoints], copyHums[totalDataPoints], copyPress[totalDataPoints];
+float adjDP_global[totalDataPoints]; // Shared by MC search passes
+
+void monteCarloTask(void *parameter) {
+  while (true) {
+    vTaskDelay(60000 / portTICK_PERIOD_MS);
+    if (bufferFull) {
+      Serial.println("Background refining starting...");
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      memcpy(copyTemps, empiricalTemperatures, sizeof(copyTemps));
+      memcpy(copyHums, empiricalHumidities, sizeof(copyHums));
+      memcpy(copyPress, empiricalPressures, sizeof(copyPress));
+      xSemaphoreGive(dataMutex);
+
+      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints);
+    }
+  }
+}
+
+void addRealTimeDataPoint(float t, float h, float p, float dp) {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  empiricalTemperatures[dataPointIndex] = t;
+  empiricalHumidities[dataPointIndex]   = h;
+  empiricalPressures[dataPointIndex]    = p;
+  empiricalDewPoints[dataPointIndex]    = dp;
+
+  dataPointIndex++;
+  if (dataPointIndex >= totalDataPoints) {
+    dataPointIndex = 0;
+    bufferFull = true;
+  }
+  xSemaphoreGive(dataMutex);
 }
 
 // ── Sensor initialisation ────────────────────────────────────────────────────
@@ -119,27 +290,42 @@ float adjustDewPointForPressure(float dewPoint, float pressure) {
   return dewPoint + (pressure - 1013.25f) * pressureFactor;
 }
 
+// Helper to get temperature-dependent adsorption factor.
+float getTempAdsorptionFactor(float temperature) {
+  float deltaT = 25.0f - temperature;
+  if (deltaT < 0) deltaT = 0;
+  return 1.0f + 0.05f * deltaT;
+}
+
 // ── Per-gas non-linear adjustments ──────────────────────────────────────────
-float adjustDewPointForCO2(float dewPoint, float concentration) {
-  float adj = co2Factor * log(1.0f + co2NonlinearCoeff * concentration);
+float adjustDewPointForCO2(float dewPoint, float concentration, float temperature) {
+  float adj = co2Factor * logf(1.0f + co2NonlinearCoeff * concentration) * getTempAdsorptionFactor(temperature);
   return dewPoint + dewPoint * adj;
 }
 
-float adjustDewPointForSO2(float dewPoint, float concentration) {
-  float adj = so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff;
+float adjustDewPointForSO2(float dewPoint, float concentration, float temperature) {
+  float adj = so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature);
   return dewPoint + dewPoint * adj;
 }
 
-float adjustDewPointForNO2(float dewPoint, float concentration) {
-  float adj = no2Factor * expf(no2NonlinearCoeff * concentration);
+float adjustDewPointForNO2(float dewPoint, float concentration, float temperature) {
+  float adj = no2Factor * (expf(no2NonlinearCoeff * concentration) - 1.0f) * getTempAdsorptionFactor(temperature);
   return dewPoint + dewPoint * adj;
 }
 
 // ── Combined contaminant adjustment ─────────────────────────────────────────
-float adjustDewPointForContaminants(float dewPoint, float co2Dev, float so2Dev, float no2Dev) {
-  dewPoint = adjustDewPointForCO2(dewPoint, co2Dev);
-  dewPoint = adjustDewPointForSO2(dewPoint, so2Dev);
-  return    adjustDewPointForNO2(dewPoint, no2Dev);
+float adjustDewPointForContaminants(float dewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature) {
+  dewPoint = adjustDewPointForCO2(dewPoint, co2Dev, temperature);
+  dewPoint = adjustDewPointForSO2(dewPoint, so2Dev, temperature);
+  return    adjustDewPointForNO2(dewPoint, no2Dev, temperature);
+}
+
+float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature) {
+  float k = getTempAdsorptionFactor(temperature);
+  float adj_co2 = co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * k;
+  float adj_so2 = so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * k;
+  float adj_no2 = no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * k;
+  return measuredDewPoint / (1.0f + adj_co2 + adj_so2 + adj_no2);
 }
 
 // ── FIX 4: Float-safe map ────────────────────────────────────────────────────
@@ -159,10 +345,9 @@ void stopCooling() {
 }
 
 // ── PID Control constants ────────────────────────────────────────────────────
-const float Kp = 120.0f;
-const float Ki = 2.5f;
-const float Kd = 15.0f;
-const float dt = 0.2f;  // 200ms loop interval
+const float Kp = 40.0f;
+const float Ki = 1.0f;
+const float Kd = 20.0f;
 
 // ── Adaptive cooling with feedback (PID Controller) ──────────────────────────
 void controlCoolingPWM(float targetTemperature) {
@@ -204,27 +389,27 @@ void controlCoolingPWM(float targetTemperature) {
     lastError = error;
 
     int pwmValue = (int)(P + I + D);
-    analogWrite(coolerPin, constrain(pwmValue, minPWM, maxPWM));
+    // Allow PWM to drop to 0 if we are already below target temperature
+    analogWrite(coolerPin, constrain(pwmValue, 0, maxPWM));
     delay(200);
   }
 }
 
 // ── Cooling profile (empirical data collection) ──────────────────────────────
-void createCoolingProfile(float estimatedDewPoint) {
-  float targetTemperatures[totalDataPoints];
+float targetTemperatures[totalDataPoints];
 
-  // FIX 2: Bracketing loop produced dp-5, dp+5, dp+5 (indices 0,1,2 all used
-  // the same "+5" branch except index 0).  Corrected to dp-5, dp, dp+5
-  // by using (i - 1) * 5 so the three bracket points are evenly spaced.
+void createCoolingProfile(float estimatedDewPoint, int numPoints) {
+  if (numPoints > totalDataPoints) numPoints = totalDataPoints;
+
   for (int i = 0; i < 3; i++) {
     targetTemperatures[i] = estimatedDewPoint + (i - 1) * 5.0f;
   }
-  // 16 fine steps from (dp - 1.0) to (dp + 0.875) at 0.125 °C increments
-  for (int i = 3; i < totalDataPoints; i++) {
-    targetTemperatures[i] = estimatedDewPoint - 1.0f + (i - 3) * 0.125f;
+  float stepSize = 2.0f / (numPoints - 3);
+  for (int i = 3; i < numPoints; i++) {
+    targetTemperatures[i] = estimatedDewPoint - 1.0f + (i - 3) * stepSize;
   }
 
-  for (int i = 0; i < totalDataPoints; i++) {
+  for (int i = 0; i < numPoints; i++) {
     controlCoolingPWM(targetTemperatures[i]);
     delay(1000);  // Stabilisation pause
 
@@ -253,9 +438,10 @@ void createCoolingProfile(float estimatedDewPoint) {
 }
 
 // ── Heating verification (SHT4x internal heater) ────────────────────────────
+float heatingDewPoints[totalDataPoints];
+
 void verifyDewPointWithHeatingProfile() {
-  const int heatingDataPoints = 10;
-  float     heatingDewPoints[heatingDataPoints];
+  const int heatingDataPoints = numHeatingPoints;
 
   // FIX 5: The original code used the non-existent SHT4X_HEATER_MEDIUM enum
   // and a two-argument form of setHeater() that doesn't exist in the Adafruit
@@ -311,19 +497,18 @@ void verifyDewPointWithHeatingProfile() {
   Serial.println(" °C");
 }
 
-// ── FIX 9 helper: RMSE between two float arrays ──────────────────────────────
-// The original Monte Carlo used fitPolynomialCurve(empiricalTemps, simDPs, n)
-// as its error metric, which fit a curve to the *simulated* data alone and
-// never referenced empiricalDewPoints at all.  RMSE between simulated and
-// empirical dew points is the correct comparison.
-float computeRMSE(float *simulated, float *empirical, int n) {
-  if (n == 0) return 1e6f;
+// ── Helper: Variance of an array ─────────────────────────────────────────────
+float computeVariance(float *data, int n) {
+  if (n <= 1) return 1e6f;
+  float sum = 0.0f;
+  for (int i = 0; i < n; i++) sum += data[i];
+  float mean = sum / n;
   float sumSq = 0.0f;
   for (int i = 0; i < n; i++) {
-    float d = simulated[i] - empirical[i];
+    float d = data[i] - mean;
     sumSq += d * d;
   }
-  return sqrtf(sumSq / n);
+  return sumSq / (n - 1);
 }
 
 // ── Quadratic least-squares fit — returns total absolute residual ─────────────
@@ -371,25 +556,28 @@ float fitPolynomialCurve(float *x, float *y, int n) {
 }
 
 // ── Monte Carlo contaminant search (Two-pass) ────────────────────────────────
-void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, float *empiricalDPs, int n) {
+void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n) {
   if (n == 0) return;
 
   float bestError = 1e6f;
-  float bestCO2   = 1.0f;
-  float bestSO2   = 1.0f;
-  float bestNO2   = 1.0f;
+  float bestCO2   = currentCO2Factor;
+  float bestSO2   = currentSO2Factor;
+  float bestNO2   = currentNO2Factor;
 
   // Pass 1: Coarse search
-  for (float co2 = 0.8f; co2 <= 1.201f; co2 += 0.05f) {
-    for (float so2 = 0.8f; so2 <= 1.201f; so2 += 0.05f) {
-      for (float no2 = 0.8f; no2 <= 1.201f; no2 += 0.05f) {
-        float simDP[totalDataPoints];
+  for (float co2 = 0.0f; co2 <= 2.01f; co2 += 0.4f) {
+    for (float so2 = 0.0f; so2 <= 2.01f; so2 += 0.4f) {
+      for (float no2 = 0.0f; no2 <= 2.01f; no2 += 0.4f) {
+        int validPoints = 0;
         for (int j = 0; j < n; j++) {
-          float baseDP = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
-          baseDP = adjustDewPointForPressure(baseDP, empiricalPressures[j]);
-          simDP[j] = adjustDewPointForContaminants(baseDP, co2, so2, no2);
+          if (empiricalHumidities[j] < 95.0f) {
+            float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
+            dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
+            adjDP_global[validPoints++] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+          }
         }
-        float err = computeRMSE(simDP, empiricalDPs, n);
+        if (validPoints < 2) continue;
+        float err = computeVariance(adjDP_global, validPoints);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
@@ -397,21 +585,49 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
     }
   }
 
-  // Pass 2: Fine search around the best coarse result
-  float startCO2 = bestCO2 - 0.04f;
-  float startSO2 = bestSO2 - 0.04f;
-  float startNO2 = bestNO2 - 0.04f;
+  // Pass 2: Medium search
+  float startCO2m = max(0.0f, bestCO2 - 0.2f);
+  float startSO2m = max(0.0f, bestSO2 - 0.2f);
+  float startNO2m = max(0.0f, bestNO2 - 0.2f);
 
-  for (float co2 = startCO2; co2 <= startCO2 + 0.081f; co2 += 0.01f) {
-    for (float so2 = startSO2; so2 <= startSO2 + 0.081f; so2 += 0.01f) {
-      for (float no2 = startNO2; no2 <= startNO2 + 0.081f; no2 += 0.01f) {
-        float simDP[totalDataPoints];
+  for (float co2 = startCO2m; co2 <= min(2.0f, startCO2m + 0.401f); co2 += 0.1f) {
+    for (float so2 = startSO2m; so2 <= min(2.0f, startSO2m + 0.401f); so2 += 0.1f) {
+      for (float no2 = startNO2m; no2 <= min(2.0f, startNO2m + 0.401f); no2 += 0.1f) {
+        int validPoints = 0;
         for (int j = 0; j < n; j++) {
-          float baseDP = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
-          baseDP = adjustDewPointForPressure(baseDP, empiricalPressures[j]);
-          simDP[j] = adjustDewPointForContaminants(baseDP, co2, so2, no2);
+          if (empiricalHumidities[j] < 95.0f) {
+            float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
+            dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
+            adjDP_global[validPoints++] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+          }
         }
-        float err = computeRMSE(simDP, empiricalDPs, n);
+        if (validPoints < 2) continue;
+        float err = computeVariance(adjDP_global, validPoints);
+        if (err < bestError) {
+          bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
+        }
+      }
+    }
+  }
+
+  // Pass 3: Fine search
+  float startCO2f = max(0.0f, bestCO2 - 0.05f);
+  float startSO2f = max(0.0f, bestSO2 - 0.05f);
+  float startNO2f = max(0.0f, bestNO2 - 0.05f);
+
+  for (float co2 = startCO2f; co2 <= min(2.0f, startCO2f + 0.101f); co2 += 0.01f) {
+    for (float so2 = startSO2f; so2 <= min(2.0f, startSO2f + 0.101f); so2 += 0.01f) {
+      for (float no2 = startNO2f; no2 <= min(2.0f, startNO2f + 0.101f); no2 += 0.01f) {
+        int validPoints = 0;
+        for (int j = 0; j < n; j++) {
+          if (empiricalHumidities[j] < 95.0f) {
+            float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
+            dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
+            adjDP_global[validPoints++] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+          }
+        }
+        if (validPoints < 2) continue;
+        float err = computeVariance(adjDP_global, validPoints);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
@@ -423,5 +639,12 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   Serial.print("Best CO2 factor: "); Serial.println(bestCO2, 3);
   Serial.print("Best SO2 factor: "); Serial.println(bestSO2, 3);
   Serial.print("Best NO2 factor: "); Serial.println(bestNO2, 3);
-  Serial.print("RMSE: ");            Serial.print(bestError, 4); Serial.println(" °C");
+  Serial.print("Min Variance: ");    Serial.print(bestError, 6); Serial.println(" °C^2");
+
+  // Update global factors for real-time application
+  xSemaphoreTake(factorMutex, portMAX_DELAY);
+  currentCO2Factor = bestCO2;
+  currentSO2Factor = bestSO2;
+  currentNO2Factor = bestNO2;
+  xSemaphoreGive(factorMutex);
 }
