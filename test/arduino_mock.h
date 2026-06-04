@@ -163,6 +163,10 @@ extern MockState g_mock;
 inline void delay(unsigned long ms) {
     g_mock.mock_millis += ms;
 
+    // Simulate drifting ambient conditions
+    g_mock.ambient_temp += 0.000001f * ms;
+    g_mock.ambient_hum  += 0.000005f * ms;
+
     const float dt = 0.001f; // 1ms
     for(unsigned long i=0; i<ms; ++i) {
         // --- Electrical Model (MOSFET + Peltier) ---

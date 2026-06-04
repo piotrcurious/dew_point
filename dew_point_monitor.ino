@@ -97,6 +97,7 @@ const char* htmlContent = R"rawliteral(
         function onMessage(event) {
             let data = JSON.parse(event.data);
             document.getElementById('stats').innerHTML =
+                `T: ${data.t.toFixed(2)} &deg;C | RH: ${data.h.toFixed(1)} %<br>` +
                 `DP: ${data.dp.toFixed(2)} &deg;C | CorrDP: ${data.cdp.toFixed(2)} &deg;C<br>` +
                 `CO2: ${data.co2.toFixed(3)} | SO2: ${data.so2.toFixed(3)} | NO2: ${data.no2.toFixed(3)}`;
 
@@ -142,9 +143,9 @@ void  createCoolingProfile(float estimatedDewPoint, int numPoints);
 void  verifyDewPointWithHeatingProfile();
 float computeRMSE(float *simulated, float *empirical, int n);
 float fitPolynomialCurve(float *x, float *y, int n);
-float computeVariance(float *data, int n);
+float computeWeightedVariance(float *data, float *weights, int n);
 float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature);
-void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n);
+void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex);
 void  addRealTimeDataPoint(float t, float h, float p, float dp);
 void  monteCarloTask(void *parameter);
 
@@ -178,8 +179,8 @@ void setup() {
   verifyDewPointWithHeatingProfile();
 
   if (dataPointIndex > 1) {
-    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex);
-    bufferFull = true;
+    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex, dataPointIndex);
+    if (dataPointIndex >= totalDataPoints) bufferFull = true;
   }
 
   // Start the background refinement task on Core 1
@@ -208,9 +209,9 @@ void loop() {
   Serial.println("]");
 
   // Send data to WebSockets
-  char json[128];
-  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f}",
-           dp, correctedDP, cCO2, cSO2, cNO2);
+  char json[256];
+  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f}",
+           dp, correctedDP, cCO2, cSO2, cNO2, t, h);
   ws.textAll(json);
 
   delay(2000);
@@ -219,6 +220,7 @@ void loop() {
 // Task local static buffers to avoid stack smashing with large totalDataPoints
 float copyTemps[totalDataPoints], copyHums[totalDataPoints], copyPress[totalDataPoints];
 float adjDP_global[totalDataPoints]; // Shared by MC search passes
+float weights_global[totalDataPoints]; // Shared by MC search passes
 
 void monteCarloTask(void *parameter) {
   while (true) {
@@ -226,12 +228,13 @@ void monteCarloTask(void *parameter) {
     if (bufferFull) {
       Serial.println("Background refining starting...");
       xSemaphoreTake(dataMutex, portMAX_DELAY);
+      int head = dataPointIndex;
       memcpy(copyTemps, empiricalTemperatures, sizeof(copyTemps));
       memcpy(copyHums, empiricalHumidities, sizeof(copyHums));
       memcpy(copyPress, empiricalPressures, sizeof(copyPress));
       xSemaphoreGive(dataMutex);
 
-      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints);
+      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, head);
     }
   }
 }
@@ -348,6 +351,7 @@ void stopCooling() {
 const float Kp = 40.0f;
 const float Ki = 1.0f;
 const float Kd = 20.0f;
+const float Kf = 5.0f; // Feed-forward gain
 
 // ── Adaptive cooling with feedback (PID Controller) ──────────────────────────
 void controlCoolingPWM(float targetTemperature) {
@@ -388,7 +392,24 @@ void controlCoolingPWM(float targetTemperature) {
     float D = Kd * (error - lastError) / dtReal;
     lastError = error;
 
-    int pwmValue = (int)(P + I + D);
+    // Feed-forward based on temperature difference (cooling against ambient)
+    float ambientRef = 25.0f;
+    float FF = Kf * (ambientRef - targetTemperature);
+
+    int pwmValue = (int)(P + I + D + FF);
+
+    // --- Safety Throttling ---
+    // In a real system, we would read these via analog pins
+    float mosfetTemp = 25.0f; // Placeholder for actual reading logic
+    float supplyV = 12.0f;    // Placeholder
+
+    // Example: Throttle if MOSFET > 70C
+    if (mosfetTemp > 70.0f) pwmValue /= 2;
+    if (mosfetTemp > 90.0f) pwmValue = 0;
+
+    // Example: Throttle if supply voltage drops below 10V
+    if (supplyV < 10.0f) pwmValue = min(pwmValue, 100);
+
     // Allow PWM to drop to 0 if we are already below target temperature
     analogWrite(coolerPin, constrain(pwmValue, 0, maxPWM));
     delay(200);
@@ -497,18 +518,23 @@ void verifyDewPointWithHeatingProfile() {
   Serial.println(" °C");
 }
 
-// ── Helper: Variance of an array ─────────────────────────────────────────────
-float computeVariance(float *data, int n) {
+// Weighted variance to prioritize recent data points.
+float computeWeightedVariance(float *data, float *weights, int n) {
   if (n <= 1) return 1e6f;
-  float sum = 0.0f;
-  for (int i = 0; i < n; i++) sum += data[i];
-  float mean = sum / n;
-  float sumSq = 0.0f;
+  float totalWeight = 0.0f;
+  float weightedSum = 0.0f;
   for (int i = 0; i < n; i++) {
-    float d = data[i] - mean;
-    sumSq += d * d;
+    weightedSum += data[i] * weights[i];
+    totalWeight += weights[i];
   }
-  return sumSq / (n - 1);
+  if (totalWeight < 1e-9f) return 1e6f;
+  float weightedMean = weightedSum / totalWeight;
+  float weightedSumSq = 0.0f;
+  for (int i = 0; i < n; i++) {
+    float d = data[i] - weightedMean;
+    weightedSumSq += weights[i] * d * d;
+  }
+  return weightedSumSq / totalWeight;
 }
 
 // ── Quadratic least-squares fit — returns total absolute residual ─────────────
@@ -555,8 +581,8 @@ float fitPolynomialCurve(float *x, float *y, int n) {
   return totalError;
 }
 
-// ── Monte Carlo contaminant search (Two-pass) ────────────────────────────────
-void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n) {
+// ── Monte Carlo contaminant search (Three-pass) ──────────────────────────────
+void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex) {
   if (n == 0) return;
 
   float bestError = 1e6f;
@@ -564,20 +590,29 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   float bestSO2   = currentSO2Factor;
   float bestNO2   = currentNO2Factor;
 
+  // Pre-calculate chronological weights for the circular buffer
+  float weights_full[totalDataPoints];
+  for (int j = 0; j < n; j++) {
+    int age = (headIndex - 1 - j + n) % n;
+    weights_full[j] = 1.0f / (1.0f + 0.001f * age);
+  }
+
   // Pass 1: Coarse search
   for (float co2 = 0.0f; co2 <= 2.01f; co2 += 0.4f) {
     for (float so2 = 0.0f; so2 <= 2.01f; so2 += 0.4f) {
       for (float no2 = 0.0f; no2 <= 2.01f; no2 += 0.4f) {
-        int validPoints = 0;
+        int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
             float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
             dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
-            adjDP_global[validPoints++] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+            adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+            weights_global[vp] = weights_full[j];
+            vp++;
           }
         }
-        if (validPoints < 2) continue;
-        float err = computeVariance(adjDP_global, validPoints);
+        if (vp < 2) continue;
+        float err = computeWeightedVariance(adjDP_global, weights_global, vp);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
@@ -593,16 +628,18 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   for (float co2 = startCO2m; co2 <= min(2.0f, startCO2m + 0.401f); co2 += 0.1f) {
     for (float so2 = startSO2m; so2 <= min(2.0f, startSO2m + 0.401f); so2 += 0.1f) {
       for (float no2 = startNO2m; no2 <= min(2.0f, startNO2m + 0.401f); no2 += 0.1f) {
-        int validPoints = 0;
+        int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
             float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
             dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
-            adjDP_global[validPoints++] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+            adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+            weights_global[vp] = weights_full[j];
+            vp++;
           }
         }
-        if (validPoints < 2) continue;
-        float err = computeVariance(adjDP_global, validPoints);
+        if (vp < 2) continue;
+        float err = computeWeightedVariance(adjDP_global, weights_global, vp);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
@@ -618,16 +655,18 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   for (float co2 = startCO2f; co2 <= min(2.0f, startCO2f + 0.101f); co2 += 0.01f) {
     for (float so2 = startSO2f; so2 <= min(2.0f, startSO2f + 0.101f); so2 += 0.01f) {
       for (float no2 = startNO2f; no2 <= min(2.0f, startNO2f + 0.101f); no2 += 0.01f) {
-        int validPoints = 0;
+        int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
             float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
             dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
-            adjDP_global[validPoints++] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+            adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
+            weights_global[vp] = weights_full[j];
+            vp++;
           }
         }
-        if (validPoints < 2) continue;
-        float err = computeVariance(adjDP_global, validPoints);
+        if (vp < 2) continue;
+        float err = computeWeightedVariance(adjDP_global, weights_global, vp);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
