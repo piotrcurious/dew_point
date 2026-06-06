@@ -6,6 +6,10 @@
 #include <string.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+
+// ── Persistent Storage ───────────────────────────────────────────────────────
+Preferences preferences;
 
 // ── Sensor instances ─────────────────────────────────────────────────────────
 Adafruit_BME280 bme;
@@ -40,6 +44,8 @@ const unsigned long coolingTimeoutMs = 300000UL;
 float currentCO2Factor = 1.0f;
 float currentSO2Factor = 1.0f;
 float currentNO2Factor = 1.0f;
+float currentConfidence = 0.0f;
+float coolingHealth    = 1.0f;
 float ambientRefTemp   = 25.0f;
 SemaphoreHandle_t factorMutex;
 
@@ -64,13 +70,23 @@ const char* htmlContent = R"rawliteral(
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <style>
         body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
-        #info { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+        #info { position: absolute; top: 10px; left: 10px; z-index: 10; }
+        #controls { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; z-index: 10; }
+        input { width: 50px; background: #333; color: #fff; border: 1px solid #555; }
+        button { cursor: pointer; background: #00aaff; color: #fff; border: none; padding: 5px 10px; border-radius: 3px; }
     </style>
 </head>
 <body>
     <div id="info">
         <h1>Dew Point Monitor</h1>
         <div id="stats">Connecting...</div>
+    </div>
+    <div id="controls">
+        <h3>Calibration Overrides</h3>
+        CO2: <input type="number" id="ico2" step="0.1"><br>
+        SO2: <input type="number" id="iso2" step="0.1"><br>
+        NO2: <input type="number" id="ino2" step="0.1"><br>
+        <button onclick="updateCal()">Update</button>
     </div>
     <script>
         let scene = new THREE.Scene();
@@ -100,7 +116,12 @@ const char* htmlContent = R"rawliteral(
             document.getElementById('stats').innerHTML =
                 `T: ${data.t.toFixed(2)} &deg;C | RH: ${data.h.toFixed(1)} %<br>` +
                 `DP: ${data.dp.toFixed(2)} &deg;C | CorrDP: ${data.cdp.toFixed(2)} &deg;C<br>` +
-                `CO2: ${data.co2.toFixed(3)} | SO2: ${data.so2.toFixed(3)} | NO2: ${data.no2.toFixed(3)}`;
+                `CO2: ${data.co2.toFixed(3)} | SO2: ${data.so2.toFixed(3)} | NO2: ${data.no2.toFixed(3)}<br>` +
+                `Fit Confidence: ${(data.conf*100).toFixed(1)}% | Cooling Health: ${(data.health*100).toFixed(1)}%`;
+
+            document.getElementById('ico2').placeholder = data.co2.toFixed(2);
+            document.getElementById('iso2').placeholder = data.so2.toFixed(2);
+            document.getElementById('ino2').placeholder = data.no2.toFixed(2);
 
             // Update WebGL visualization (scroll points)
             for (let i = 0; i < pointsCount - 1; i++) {
@@ -112,6 +133,15 @@ const char* htmlContent = R"rawliteral(
             geometry.attributes.position.needsUpdate = true;
         }
         window.onload = initWebSocket;
+
+        function updateCal() {
+            let msg = {
+                co2: parseFloat(document.getElementById('ico2').value),
+                so2: parseFloat(document.getElementById('iso2').value),
+                no2: parseFloat(document.getElementById('ino2').value)
+            };
+            websocket.send(JSON.stringify(msg));
+        }
 
         function animate() {
             requestAnimationFrame(animate);
@@ -150,17 +180,42 @@ float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev
 void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex);
 void  addRealTimeDataPoint(float t, float h, float p, float dp);
 void  monteCarloTask(void *parameter);
+void  loadCalibration();
+void  saveCalibration(float co2, float so2, float no2);
 
 // ── Web Handlers ─────────────────────────────────────────────────────────────
 void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
              void *arg, uint8_t *data, size_t len) {
-  // Handle WS events if needed
+  if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len) {
+      char *msg = (char*)malloc(len + 1);
+      memcpy(msg, data, len);
+      msg[len] = '\0';
+
+      // Simple manual JSON parsing to avoid heavy library for 3 floats
+      float f1 = -1, f2 = -1, f3 = -1;
+      sscanf(msg, "{\"co2\":%f,\"so2\":%f,\"no2\":%f}", &f1, &f2, &f3);
+
+      xSemaphoreTake(factorMutex, portMAX_DELAY);
+      if (f1 >= 0) currentCO2Factor = f1;
+      if (f2 >= 0) currentSO2Factor = f2;
+      if (f3 >= 0) currentNO2Factor = f3;
+      xSemaphoreGive(factorMutex);
+
+      if (f1 >= 0 || f2 >= 0 || f3 >= 0) {
+        saveCalibration(currentCO2Factor, currentSO2Factor, currentNO2Factor);
+      }
+      free(msg);
+    }
+  }
 }
 
 // ── setup() ──────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   initializeSensors();
+  loadCalibration();
 
   // WiFi Setup (using stubs in mock)
   WiFi.begin("SSID", "PASS");
@@ -213,8 +268,8 @@ void loop() {
 
   // Send data to WebSockets
   char json[256];
-  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f}",
-           dp, correctedDP, cCO2, cSO2, cNO2, t, h);
+  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f,\"conf\":%.3f,\"health\":%.3f}",
+           dp, correctedDP, cCO2, cSO2, cNO2, t, h, currentConfidence, coolingHealth);
   ws.textAll(json);
 
   delay(2000);
@@ -415,6 +470,14 @@ void controlCoolingPWM(float targetTemperature) {
 
     // Example: Throttle if supply voltage drops below 10V
     if (supplyV < 10.0f) pwmValue = min(pwmValue, 100);
+
+    // --- Cooling Performance Monitor ---
+    // If PWM is high but temperature error isn't reducing, health drops
+    if (pwmValue > 200 && error > 1.0f && (now - lastMs > 5000)) {
+        coolingHealth *= 0.99f; // Gradual decay if struggling
+    } else if (fabsf(error) < 0.2f) {
+        coolingHealth = (coolingHealth * 0.99f) + 0.01f; // Recover health if stable
+    }
 
     // Allow PWM to drop to 0 if we are already below target temperature
     analogWrite(coolerPin, constrain(pwmValue, 0, maxPWM));
@@ -720,12 +783,44 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   Serial.print("Best CO2 factor: "); Serial.println(bestCO2, 3);
   Serial.print("Best SO2 factor: "); Serial.println(bestSO2, 3);
   Serial.print("Best NO2 factor: "); Serial.println(bestNO2, 3);
-  Serial.print("Min Variance: ");    Serial.print(bestError, 6); Serial.println(" °C^2");
+  Serial.print("Final Cost: ");    Serial.print(bestError, 6);
 
-  // Update global factors for real-time application
+  // --- Convergence Check & Confidence Calculation ---
+  // Confidence is inversely related to the bestError.
+  // Assuming a 'good' fit has error < 1.0 (arbitrary threshold for normalized cost)
+  float confidence = 1.0f / (1.0f + bestError);
+
+  // Only update if confidence is reasonable or better than before
   xSemaphoreTake(factorMutex, portMAX_DELAY);
-  currentCO2Factor = bestCO2;
-  currentSO2Factor = bestSO2;
-  currentNO2Factor = bestNO2;
+  bool improved = (confidence > currentConfidence * 1.05f) || (currentConfidence < 0.1f);
+  if (improved) {
+    currentCO2Factor = bestCO2;
+    currentSO2Factor = bestSO2;
+    currentNO2Factor = bestNO2;
+    currentConfidence = confidence;
+    Serial.println(" [UPDATED]");
+    saveCalibration(bestCO2, bestSO2, bestNO2);
+  } else {
+    Serial.println(" [REJECTED - No significant improvement]");
+  }
   xSemaphoreGive(factorMutex);
+}
+
+// ── Persistent Calibration Helpers ──────────────────────────────────────────
+void loadCalibration() {
+  preferences.begin("calibration", true); // Read-only
+  currentCO2Factor = preferences.getFloat("co2", 1.0f);
+  currentSO2Factor = preferences.getFloat("so2", 1.0f);
+  currentNO2Factor = preferences.getFloat("no2", 1.0f);
+  preferences.end();
+  Serial.println("Calibration loaded from NVS.");
+}
+
+void saveCalibration(float co2, float so2, float no2) {
+  preferences.begin("calibration", false); // Read-write
+  preferences.putFloat("co2", co2);
+  preferences.putFloat("so2", so2);
+  preferences.putFloat("no2", no2);
+  preferences.end();
+  Serial.println("Calibration saved to NVS.");
 }
