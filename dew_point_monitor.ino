@@ -17,9 +17,9 @@ const float B             = 237.7f;
 const float pressureFactor = 0.001f;   // °C / hPa deviation from std pressure
 
 // ── Non-linear contaminant-gas adjustment factors ────────────────────────────
-const float co2Factor         = 0.0025f;  // Logarithmic scale (CO₂)
-const float so2Factor         = 0.008f;   // Polynomial scale  (SO₂)
-const float no2Factor         = 0.005f;   // Exponential scale (NO₂)
+const float co2Factor         = 0.025f;   // Logarithmic scale (CO₂)
+const float so2Factor         = 0.08f;    // Polynomial scale  (SO₂)
+const float no2Factor         = 0.05f;    // Exponential scale (NO₂)
 const float co2NonlinearCoeff = 0.4f;
 const float so2NonlinearCoeff = 0.9f;
 const float no2NonlinearCoeff = 1.2f;
@@ -40,6 +40,7 @@ const unsigned long coolingTimeoutMs = 300000UL;
 float currentCO2Factor = 1.0f;
 float currentSO2Factor = 1.0f;
 float currentNO2Factor = 1.0f;
+float ambientRefTemp   = 25.0f;
 SemaphoreHandle_t factorMutex;
 
 // ── Empirical data storage (Circular buffer for real-time monitoring) ────────
@@ -131,7 +132,7 @@ void  initializeSensors();
 float estimateInitialDewPoint();
 float calculateDewPoint(float temperature, float humidity);
 float adjustDewPointForPressure(float dewPoint, float pressure);
-float getTempAdsorptionFactor(float temperature);
+float getTempAdsorptionFactor(float temperature, float coeff);
 float adjustDewPointForCO2(float dewPoint, float concentration, float temperature);
 float adjustDewPointForSO2(float dewPoint, float concentration, float temperature);
 float adjustDewPointForNO2(float dewPoint, float concentration, float temperature);
@@ -144,6 +145,7 @@ void  verifyDewPointWithHeatingProfile();
 float computeRMSE(float *simulated, float *empirical, int n);
 float fitPolynomialCurve(float *x, float *y, int n);
 float computeWeightedVariance(float *data, float *weights, int n);
+float computeTemperatureCorrelation(float *dewPoints, float *temps, float *weights, int n);
 float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature);
 void  monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex);
 void  addRealTimeDataPoint(float t, float h, float p, float dp);
@@ -174,6 +176,7 @@ void setup() {
   factorMutex = xSemaphoreCreateMutex();
 
   Serial.println("Starting initial calibration profile...");
+  ambientRefTemp = bme.readTemperature();
   float estimatedDewPoint = estimateInitialDewPoint();
   createCoolingProfile(estimatedDewPoint, numCoolingPoints);
   verifyDewPointWithHeatingProfile();
@@ -219,8 +222,9 @@ void loop() {
 
 // Task local static buffers to avoid stack smashing with large totalDataPoints
 float copyTemps[totalDataPoints], copyHums[totalDataPoints], copyPress[totalDataPoints];
-float adjDP_global[totalDataPoints]; // Shared by MC search passes
-float weights_global[totalDataPoints]; // Shared by MC search passes
+float adjDP_global[totalDataPoints];    // Shared by MC search passes
+float weights_global[totalDataPoints];  // Shared by MC search passes
+float vTemps_global[totalDataPoints];    // Corresponding temps for correlation
 
 void monteCarloTask(void *parameter) {
   while (true) {
@@ -294,25 +298,29 @@ float adjustDewPointForPressure(float dewPoint, float pressure) {
 }
 
 // Helper to get temperature-dependent adsorption factor.
-float getTempAdsorptionFactor(float temperature) {
-  float deltaT = 25.0f - temperature;
+float getTempAdsorptionFactor(float temperature, float coeff) {
+  float deltaT = ambientRefTemp - temperature;
   if (deltaT < 0) deltaT = 0;
-  return 1.0f + 0.05f * deltaT;
+  return 1.0f + coeff * deltaT;
 }
 
 // ── Per-gas non-linear adjustments ──────────────────────────────────────────
+const float co2TempCoeff = 0.02f;
+const float so2TempCoeff = 0.05f;
+const float no2TempCoeff = 0.08f;
+
 float adjustDewPointForCO2(float dewPoint, float concentration, float temperature) {
-  float adj = co2Factor * logf(1.0f + co2NonlinearCoeff * concentration) * getTempAdsorptionFactor(temperature);
+  float adj = co2Factor * logf(1.0f + co2NonlinearCoeff * concentration) * getTempAdsorptionFactor(temperature, co2TempCoeff);
   return dewPoint + dewPoint * adj;
 }
 
 float adjustDewPointForSO2(float dewPoint, float concentration, float temperature) {
-  float adj = so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature);
+  float adj = so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature, so2TempCoeff);
   return dewPoint + dewPoint * adj;
 }
 
 float adjustDewPointForNO2(float dewPoint, float concentration, float temperature) {
-  float adj = no2Factor * (expf(no2NonlinearCoeff * concentration) - 1.0f) * getTempAdsorptionFactor(temperature);
+  float adj = no2Factor * (expf(no2NonlinearCoeff * concentration) - 1.0f) * getTempAdsorptionFactor(temperature, no2TempCoeff);
   return dewPoint + dewPoint * adj;
 }
 
@@ -324,10 +332,9 @@ float adjustDewPointForContaminants(float dewPoint, float co2Dev, float so2Dev, 
 }
 
 float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature) {
-  float k = getTempAdsorptionFactor(temperature);
-  float adj_co2 = co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * k;
-  float adj_so2 = so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * k;
-  float adj_no2 = no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * k;
+  float adj_co2 = co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * getTempAdsorptionFactor(temperature, co2TempCoeff);
+  float adj_so2 = so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature, so2TempCoeff);
+  float adj_no2 = no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * getTempAdsorptionFactor(temperature, no2TempCoeff);
   return measuredDewPoint / (1.0f + adj_co2 + adj_so2 + adj_no2);
 }
 
@@ -393,14 +400,13 @@ void controlCoolingPWM(float targetTemperature) {
     lastError = error;
 
     // Feed-forward based on temperature difference (cooling against ambient)
-    float ambientRef = 25.0f;
-    float FF = Kf * (ambientRef - targetTemperature);
+    float FF = Kf * (ambientRefTemp - targetTemperature);
 
     int pwmValue = (int)(P + I + D + FF);
 
     // --- Safety Throttling ---
     // In a real system, we would read these via analog pins
-    float mosfetTemp = 25.0f; // Placeholder for actual reading logic
+    float mosfetTemp = ambientRefTemp; // Use start-of-run ambient as proxy
     float supplyV = 12.0f;    // Placeholder
 
     // Example: Throttle if MOSFET > 70C
@@ -537,6 +543,31 @@ float computeWeightedVariance(float *data, float *weights, int n) {
   return weightedSumSq / totalWeight;
 }
 
+// Multidimensional cost helper: checks if the corrected dew point is still
+// correlated with temperature (indicating cross-sensitivity is not removed).
+float computeTemperatureCorrelation(float *dewPoints, float *temps, float *weights, int n) {
+  if (n <= 1) return 0.0f;
+  float totalW = 0.0f, sumW_T = 0.0f, sumW_DP = 0.0f;
+  for (int i = 0; i < n; i++) {
+    sumW_T  += temps[i] * weights[i];
+    sumW_DP += dewPoints[i] * weights[i];
+    totalW  += weights[i];
+  }
+  float meanT = sumW_T / totalW;
+  float meanDP = sumW_DP / totalW;
+
+  float numerator = 0.0f, denT = 0.0f, denDP = 0.0f;
+  for (int i = 0; i < n; i++) {
+    float dT = temps[i] - meanT;
+    float dDP = dewPoints[i] - meanDP;
+    numerator += weights[i] * dT * dDP;
+    denT += weights[i] * dT * dT;
+    denDP += weights[i] * dDP * dDP;
+  }
+  if (denT < 1e-6f || denDP < 1e-6f) return 0.0f;
+  return fabsf(numerator / sqrtf(denT * denDP));
+}
+
 // ── Quadratic least-squares fit — returns total absolute residual ─────────────
 // (Kept as a standalone diagnostic; no longer misused as the Monte Carlo
 //  error metric.)
@@ -581,7 +612,7 @@ float fitPolynomialCurve(float *x, float *y, int n) {
   return totalError;
 }
 
-// ── Monte Carlo contaminant search (Three-pass) ──────────────────────────────
+// ── Monte Carlo contaminant search (Three-pass, Multidimensional Cost) ───────
 void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex) {
   if (n == 0) return;
 
@@ -594,13 +625,15 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   float weights_full[totalDataPoints];
   for (int j = 0; j < n; j++) {
     int age = (headIndex - 1 - j + n) % n;
-    weights_full[j] = 1.0f / (1.0f + 0.001f * age);
+    // Chronological weighting is NOT enough to separate drift.
+    // Instead, we use flat weighting for the cost, but could use it for recent bias.
+    weights_full[j] = 1.0f;
   }
 
   // Pass 1: Coarse search
-  for (float co2 = 0.0f; co2 <= 2.01f; co2 += 0.4f) {
-    for (float so2 = 0.0f; so2 <= 2.01f; so2 += 0.4f) {
-      for (float no2 = 0.0f; no2 <= 2.01f; no2 += 0.4f) {
+  for (float co2 = 0.0f; co2 <= 5.01f; co2 += 1.0f) {
+    for (float so2 = 0.0f; so2 <= 5.01f; so2 += 1.0f) {
+      for (float no2 = 0.0f; no2 <= 5.01f; no2 += 1.0f) {
         int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
@@ -608,11 +641,14 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
             dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
             adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
             weights_global[vp] = weights_full[j];
+            vTemps_global[vp]  = empiricalTemps[j];
             vp++;
           }
         }
         if (vp < 2) continue;
-        float err = computeWeightedVariance(adjDP_global, weights_global, vp);
+        float var = computeWeightedVariance(adjDP_global, weights_global, vp);
+        float corr = computeTemperatureCorrelation(adjDP_global, vTemps_global, weights_global, vp);
+        float err = (100.0f * corr) + var + 0.1f * (co2 + so2 + no2);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
@@ -621,13 +657,13 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   }
 
   // Pass 2: Medium search
-  float startCO2m = max(0.0f, bestCO2 - 0.2f);
-  float startSO2m = max(0.0f, bestSO2 - 0.2f);
-  float startNO2m = max(0.0f, bestNO2 - 0.2f);
+  float startCO2m = max(0.0f, bestCO2 - 0.5f);
+  float startSO2m = max(0.0f, bestSO2 - 0.5f);
+  float startNO2m = max(0.0f, bestNO2 - 0.5f);
 
-  for (float co2 = startCO2m; co2 <= min(2.0f, startCO2m + 0.401f); co2 += 0.1f) {
-    for (float so2 = startSO2m; so2 <= min(2.0f, startSO2m + 0.401f); so2 += 0.1f) {
-      for (float no2 = startNO2m; no2 <= min(2.0f, startNO2m + 0.401f); no2 += 0.1f) {
+  for (float co2 = startCO2m; co2 <= min(5.0f, startCO2m + 1.01f); co2 += 0.2f) {
+    for (float so2 = startSO2m; so2 <= min(5.0f, startSO2m + 1.01f); so2 += 0.2f) {
+      for (float no2 = startNO2m; no2 <= min(5.0f, startNO2m + 1.01f); no2 += 0.2f) {
         int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
@@ -635,11 +671,14 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
             dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
             adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
             weights_global[vp] = weights_full[j];
+            vTemps_global[vp]  = empiricalTemps[j];
             vp++;
           }
         }
         if (vp < 2) continue;
-        float err = computeWeightedVariance(adjDP_global, weights_global, vp);
+        float var = computeWeightedVariance(adjDP_global, weights_global, vp);
+        float corr = computeTemperatureCorrelation(adjDP_global, vTemps_global, weights_global, vp);
+        float err = (100.0f * corr) + var + 0.1f * (co2 + so2 + no2);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
@@ -648,13 +687,13 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   }
 
   // Pass 3: Fine search
-  float startCO2f = max(0.0f, bestCO2 - 0.05f);
-  float startSO2f = max(0.0f, bestSO2 - 0.05f);
-  float startNO2f = max(0.0f, bestNO2 - 0.05f);
+  float startCO2f = max(0.0f, bestCO2 - 0.1f);
+  float startSO2f = max(0.0f, bestSO2 - 0.1f);
+  float startNO2f = max(0.0f, bestNO2 - 0.1f);
 
-  for (float co2 = startCO2f; co2 <= min(2.0f, startCO2f + 0.101f); co2 += 0.01f) {
-    for (float so2 = startSO2f; so2 <= min(2.0f, startSO2f + 0.101f); so2 += 0.01f) {
-      for (float no2 = startNO2f; no2 <= min(2.0f, startNO2f + 0.101f); no2 += 0.01f) {
+  for (float co2 = startCO2f; co2 <= min(5.0f, startCO2f + 0.201f); co2 += 0.05f) {
+    for (float so2 = startSO2f; so2 <= min(5.0f, startSO2f + 0.201f); so2 += 0.05f) {
+      for (float no2 = startNO2f; no2 <= min(5.0f, startNO2f + 0.201f); no2 += 0.05f) {
         int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
@@ -662,11 +701,14 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
             dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
             adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
             weights_global[vp] = weights_full[j];
+            vTemps_global[vp]  = empiricalTemps[j];
             vp++;
           }
         }
         if (vp < 2) continue;
-        float err = computeWeightedVariance(adjDP_global, weights_global, vp);
+        float var = computeWeightedVariance(adjDP_global, weights_global, vp);
+        float corr = computeTemperatureCorrelation(adjDP_global, vTemps_global, weights_global, vp);
+        float err = (100.0f * corr) + var + 0.1f * (co2 + so2 + no2);
         if (err < bestError) {
           bestError = err; bestCO2 = co2; bestSO2 = so2; bestNO2 = no2;
         }
