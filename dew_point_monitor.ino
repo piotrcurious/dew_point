@@ -85,73 +85,136 @@ const char* htmlContent = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Dew Point Monitor</title>
+    <title>Advanced Dew Point Monitor</title>
     <script src="/three.min.js"></script>
     <style>
-        body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
-        #info { position: absolute; top: 10px; left: 10px; z-index: 10; }
-        #controls { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; z-index: 10; }
-        input { width: 50px; background: #333; color: #fff; border: 1px solid #555; }
-        button { cursor: pointer; background: #00aaff; color: #fff; border: none; padding: 5px 10px; border-radius: 3px; }
+        body { margin: 0; overflow: hidden; background: #050505; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        .panel { position: absolute; background: rgba(20, 20, 20, 0.85); backdrop-filter: blur(10px); padding: 20px; border: 1px solid rgba(255,255,255,0.1); pointer-events: auto; }
+        #stats-panel { top: 20px; left: 20px; width: 300px; border-radius: 8px; border-left: 4px solid #00aaff; }
+        #controls-panel { top: 20px; right: 20px; width: 220px; border-radius: 8px; }
+        h1 { font-size: 1.2em; margin: 0 0 15px 0; color: #00aaff; text-transform: uppercase; letter-spacing: 2px; }
+        .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-family: monospace; font-size: 1.1em; }
+        .label { color: #888; }
+        .value { color: #00ffcc; }
+        .unit { color: #555; font-size: 0.8em; margin-left: 4px; }
+        hr { border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin: 15px 0; }
+        input { width: 100%; background: #111; color: #fff; border: 1px solid #333; padding: 5px; margin: 5px 0; border-radius: 4px; }
+        button { width: 100%; cursor: pointer; background: #00aaff; color: #fff; border: none; padding: 10px; margin-top: 10px; border-radius: 4px; transition: 0.3s; font-weight: bold; }
+        button:hover { background: #0088cc; box-shadow: 0 0 15px rgba(0,170,255,0.4); }
+        #status-bar { position: absolute; bottom: 20px; left: 20px; color: #666; font-size: 0.8em; }
+        .error { color: #ff3333 !important; }
     </style>
 </head>
 <body>
-    <div id="info">
-        <h1>Dew Point Monitor</h1>
-        <div id="stats">Connecting...</div>
+    <div id="overlay">
+        <div id="stats-panel" class="panel">
+            <h1>Environment</h1>
+            <div class="data-row"><span class="label">Temperature</span><span class="value" id="val-t">--</span><span class="unit">°C</span></div>
+            <div class="data-row"><span class="label">Humidity</span><span class="value" id="val-h">--</span><span class="unit">%</span></div>
+            <hr>
+            <h1>Dew Point</h1>
+            <div class="data-row"><span class="label">Raw DP</span><span class="value" id="val-dp">--</span><span class="unit">°C</span></div>
+            <div class="data-row"><span class="label">Corrected</span><span class="value" id="val-cdp" style="color:#00ff00">--</span><span class="unit">°C</span></div>
+            <hr>
+            <h1>System</h1>
+            <div class="data-row"><span class="label">Fit Conf.</span><span class="value" id="val-conf">--</span><span class="unit">%</span></div>
+            <div class="data-row"><span class="label">Cooling Health</span><span class="value" id="val-health">--</span><span class="unit">%</span></div>
+        </div>
+
+        <div id="controls-panel" class="panel">
+            <h1>Calibration</h1>
+            CO2 Factor
+            <input type="number" id="ico2" step="0.01" placeholder="CO2">
+            SO2 Factor
+            <input type="number" id="iso2" step="0.01" placeholder="SO2">
+            NO2 Factor
+            <input type="number" id="ino2" step="0.01" placeholder="NO2">
+            <button onclick="updateCal()">Commit Calibration</button>
+        </div>
+        <div id="status-bar">WebSocket: <span id="ws-status">Disconnected</span> | Standalone Mode v3.1</div>
     </div>
-    <div id="controls">
-        <h3>Calibration Overrides</h3>
-        CO2: <input type="number" id="ico2" step="0.1"><br>
-        SO2: <input type="number" id="iso2" step="0.1"><br>
-        NO2: <input type="number" id="ino2" step="0.1"><br>
-        <button onclick="updateCal()">Update</button>
-    </div>
+
     <script>
         let scene = new THREE.Scene();
         let camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        let renderer = new THREE.WebGLRenderer({ antialias: true });
+        let renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setClearColor(0x050505, 1);
         renderer.setSize(window.innerWidth, window.innerHeight);
         document.body.appendChild(renderer.domElement);
 
-        let geometry = new THREE.BufferGeometry();
-        let pointsCount = 500;
-        let positions = new Float32Array(pointsCount * 3);
-        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        let material = new THREE.PointsMaterial({ color: 0x00aaff, size: 0.5 });
-        let points = new THREE.Points(geometry, material);
-        scene.add(points);
+        // Add 3D Grid
+        let grid = new THREE.GridHelper(100, 20, 0x00aaff, 0x222222);
+        grid.rotation.x = Math.PI / 2;
+        grid.position.z = -10;
+        scene.add(grid);
 
-        camera.position.z = 50;
+        // Data point geometries
+        const pointsCount = 500;
+        let rawGeo = new THREE.BufferGeometry();
+        let corrGeo = new THREE.BufferGeometry();
+        let rawPos = new Float32Array(pointsCount * 3);
+        let corrPos = new Float32Array(pointsCount * 3);
 
-        let gateway = `ws://${window.location.hostname}/ws`;
+        rawGeo.setAttribute('position', new THREE.BufferAttribute(rawPos, 3));
+        corrGeo.setAttribute('position', new THREE.BufferAttribute(corrPos, 3));
+
+        let rawMat = new THREE.PointsMaterial({ color: 0xff3333, size: 0.4, transparent: true, opacity: 0.6 });
+        let corrMat = new THREE.PointsMaterial({ color: 0x00ffcc, size: 0.6, transparent: true, opacity: 0.9 });
+
+        let rawPoints = new THREE.Points(rawGeo, rawMat);
+        let corrPoints = new THREE.Points(corrGeo, corrMat);
+        scene.add(rawPoints);
+        scene.add(corrPoints);
+
+        camera.position.set(0, 0, 40);
+        camera.lookAt(0, 0, 0);
+
         let websocket;
         function initWebSocket() {
-            websocket = new WebSocket(gateway);
+            websocket = new WebSocket(`ws://${window.location.hostname}/ws`);
+            websocket.onopen = () => document.getElementById('ws-status').innerText = 'Connected';
+            websocket.onclose = () => {
+                document.getElementById('ws-status').innerText = 'Disconnected';
+                setTimeout(initWebSocket, 2000);
+            };
             websocket.onmessage = onMessage;
         }
+
         function onMessage(event) {
             let data = JSON.parse(event.data);
-            document.getElementById('stats').innerHTML =
-                `T: ${data.t.toFixed(2)} &deg;C | RH: ${data.h.toFixed(1)} %<br>` +
-                `DP: ${data.dp.toFixed(2)} &deg;C | CorrDP: ${data.cdp.toFixed(2)} &deg;C<br>` +
-                `CO2: ${data.co2.toFixed(3)} | SO2: ${data.so2.toFixed(3)} | NO2: ${data.no2.toFixed(3)}<br>` +
-                `Fit Confidence: ${(data.conf*100).toFixed(1)}% | Cooling Health: ${(data.health*100).toFixed(1)}%`;
-
-            document.getElementById('ico2').placeholder = data.co2.toFixed(2);
-            document.getElementById('iso2').placeholder = data.so2.toFixed(2);
-            document.getElementById('ino2').placeholder = data.no2.toFixed(2);
-
-            // Update WebGL visualization (scroll points)
-            for (let i = 0; i < pointsCount - 1; i++) {
-                positions[i * 3 + 1] = positions[(i + 1) * 3 + 1];
-                positions[i * 3 + 0] = (i / 10.0) - 25.0;
+            if (data.error) {
+                document.getElementById('val-t').innerHTML = "ERROR";
+                document.getElementById('val-t').className = "value error";
+                return;
             }
-            positions[(pointsCount - 1) * 3 + 1] = data.cdp - 15; // Offset for view
-            positions[(pointsCount - 1) * 3 + 0] = ((pointsCount - 1) / 10.0) - 25.0;
-            geometry.attributes.position.needsUpdate = true;
+            document.getElementById('val-t').innerText = data.t.toFixed(2);
+            document.getElementById('val-h').innerText = data.h.toFixed(1);
+            document.getElementById('val-dp').innerText = data.dp.toFixed(2);
+            document.getElementById('val-cdp').innerText = data.cdp.toFixed(2);
+            document.getElementById('val-conf').innerText = (data.conf * 100).toFixed(1);
+            document.getElementById('val-health').innerText = (data.health * 100).toFixed(1);
+
+            document.getElementById('ico2').placeholder = data.co2.toFixed(3);
+            document.getElementById('iso2').placeholder = data.so2.toFixed(3);
+            document.getElementById('ino2').placeholder = data.no2.toFixed(3);
+
+            // Shift buffers
+            for (let i = 0; i < pointsCount - 1; i++) {
+                rawPos[i * 3 + 1] = rawPos[(i + 1) * 3 + 1];
+                corrPos[i * 3 + 1] = corrPos[(i + 1) * 3 + 1];
+            }
+
+            // New points
+            let x = ((pointsCount - 1) / 10.0) - 25.0;
+            rawPos[(pointsCount - 1) * 3] = x;
+            rawPos[(pointsCount - 1) * 3 + 1] = data.dp - 15;
+            corrPos[(pointsCount - 1) * 3] = x;
+            corrPos[(pointsCount - 1) * 3 + 1] = data.cdp - 15;
+
+            rawGeo.attributes.position.needsUpdate = true;
+            corrGeo.attributes.position.needsUpdate = true;
         }
-        window.onload = initWebSocket;
 
         function updateCal() {
             let msg = {
@@ -164,9 +227,20 @@ const char* htmlContent = R"rawliteral(
 
         function animate() {
             requestAnimationFrame(animate);
+            // Subtle rotation for 3D effect
+            rawPoints.rotation.y = Math.sin(Date.now() * 0.0005) * 0.1;
+            corrPoints.rotation.y = Math.sin(Date.now() * 0.0005) * 0.1;
             renderer.render(scene, camera);
         }
+
+        window.onload = initWebSocket;
         animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
     </script>
 </body>
 </html>
