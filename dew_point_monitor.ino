@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
+#include "three_js_bundle.h"
 
 // ── Persistent Storage ───────────────────────────────────────────────────────
 Preferences preferences;
@@ -85,7 +86,7 @@ const char* htmlContent = R"rawliteral(
 <html>
 <head>
     <title>Dew Point Monitor</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="/three.min.js"></script>
     <style>
         body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
         #info { position: absolute; top: 10px; left: 10px; z-index: 10; }
@@ -259,6 +260,14 @@ void setup() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/html", htmlContent);
   });
+
+  // Serve the local compressed Three.js copy
+  server.on("/three.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    AsyncWebServerResponse *response = request->beginResponse_P(200, "application/javascript", three_js_gz, three_js_gz_len);
+    response->addHeader("Content-Encoding", "gzip");
+    request->send(response);
+  });
+
   server.begin();
 
   dataMutex = xSemaphoreCreateMutex();
