@@ -29,8 +29,9 @@ const float so2NonlinearCoeff = 0.9f;
 const float no2NonlinearCoeff = 1.2f;
 
 // ── PWM / pin settings ───────────────────────────────────────────────────────
-const int   coolerPin         = 9;
-const int   heaterPin         = 8;        // Reserved for external heater
+// Pins 16 and 17 are safe on most ESP32 boards (avoid 6-11).
+const int   coolerPin         = 16;
+const int   heaterPin         = 17;        // Reserved for external heater
 const int   maxPWM            = 255;
 const int   minPWM            = 50;
 const int   numCoolingPoints  = 100;
@@ -39,6 +40,16 @@ const int   totalDataPoints   = 500; // Large buffer for RT monitoring
 
 // FIX 3: Safety timeout for the cooling control loop (5 minutes).
 const unsigned long coolingTimeoutMs = 300000UL;
+
+// ── Filtering Constants ──────────────────────────────────────────────────────
+const float emaAlphaT = 0.2f;  // Temperature smoothing
+const float emaAlphaH = 0.1f;  // Humidity smoothing (slower)
+const float emaAlphaP = 0.5f;  // Pressure smoothing
+
+// ── Filtered Values ──────────────────────────────────────────────────────────
+float filteredT = 25.0f;
+float filteredH = 50.0f;
+float filteredP = 1013.25f;
 
 // ── Global factors (refined over time) ───────────────────────────────────────
 float currentCO2Factor = 1.0f;
@@ -57,6 +68,13 @@ float empiricalPressures[totalDataPoints];
 int   dataPointIndex = 0;
 bool  bufferFull = false;
 SemaphoreHandle_t dataMutex;
+
+// ── Task local static buffers (moved to global for setup access) ─────────────
+float copyTemps[totalDataPoints], copyHums[totalDataPoints], copyPress[totalDataPoints];
+float rawDewPoints[totalDataPoints];    // Optimized: Pre-calculate to speed up MC passes
+float adjDP_global[totalDataPoints];    // Shared by MC search passes
+float weights_global[totalDataPoints];  // Shared by MC search passes
+float vTemps_global[totalDataPoints];   // Corresponding temps for correlation
 
 // ── Web Server & WebSockets ──────────────────────────────────────────────────
 AsyncWebServer server(80);
@@ -182,6 +200,9 @@ void  addRealTimeDataPoint(float t, float h, float p, float dp);
 void  monteCarloTask(void *parameter);
 void  loadCalibration();
 void  saveCalibration(float co2, float so2, float no2);
+bool  checkSensorHealth();
+void  enterSafeMode(const char* reason);
+void  performSelfTest();
 
 // ── Web Handlers ─────────────────────────────────────────────────────────────
 void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
@@ -193,9 +214,21 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
       memcpy(msg, data, len);
       msg[len] = '\0';
 
-      // Simple manual JSON parsing to avoid heavy library for 3 floats
+      // Robust manual JSON parsing (handles different order, spacing, and quotes)
       float f1 = -1, f2 = -1, f3 = -1;
-      sscanf(msg, "{\"co2\":%f,\"so2\":%f,\"no2\":%f}", &f1, &f2, &f3);
+      auto parseField = [](const char* payload, const char* field) -> float {
+        const char* p = strstr(payload, field);
+        if (!p) return -1.0f;
+        p += strlen(field);
+        // Skip over key-value separator and any whitespace/quotes
+        while (*p && (*p == '\"' || *p == ' ' || *p == ':')) p++;
+        if (*p == '\0' || *p == ',' || *p == '}') return -1.0f; // Invalid/empty value
+        return (float)atof(p);
+      };
+
+      f1 = parseField(msg, "\"co2\"");
+      f2 = parseField(msg, "\"so2\"");
+      f3 = parseField(msg, "\"no2\"");
 
       xSemaphoreTake(factorMutex, portMAX_DELAY);
       if (f1 >= 0) currentCO2Factor = f1;
@@ -215,6 +248,7 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
 void setup() {
   Serial.begin(115200);
   initializeSensors();
+  performSelfTest();
   loadCalibration();
 
   // WiFi Setup (using stubs in mock)
@@ -237,6 +271,11 @@ void setup() {
   verifyDewPointWithHeatingProfile();
 
   if (dataPointIndex > 1) {
+    // Populate rawDewPoints before initial simulation
+    for (int i = 0; i < dataPointIndex; i++) {
+        float dp = calculateDewPoint(empiricalTemperatures[i], empiricalHumidities[i]);
+        rawDewPoints[i] = adjustDewPointForPressure(dp, empiricalPressures[i]);
+    }
     monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex, dataPointIndex);
     if (dataPointIndex >= totalDataPoints) bufferFull = true;
   }
@@ -246,9 +285,25 @@ void setup() {
 }
 
 void loop() {
-  float t = bme.readTemperature();
-  float h = bme.readHumidity();
-  float p = bme.readPressure() / 100.0f;
+  if (!checkSensorHealth()) {
+    enterSafeMode("Sensor Failure");
+    delay(5000);
+    return;
+  }
+
+  float rawT = bme.readTemperature();
+  float rawH = bme.readHumidity();
+  float rawP = bme.readPressure() / 100.0f;
+
+  // Apply EMA Filtering
+  filteredT = (emaAlphaT * rawT) + (1.0f - emaAlphaT) * filteredT;
+  filteredH = (emaAlphaH * rawH) + (1.0f - emaAlphaH) * filteredH;
+  filteredP = (emaAlphaP * rawP) + (1.0f - emaAlphaP) * filteredP;
+
+  float t = filteredT;
+  float h = filteredH;
+  float p = filteredP;
+
   float dp = calculateDewPoint(t, h);
   dp = adjustDewPointForPressure(dp, p);
 
@@ -275,12 +330,6 @@ void loop() {
   delay(2000);
 }
 
-// Task local static buffers to avoid stack smashing with large totalDataPoints
-float copyTemps[totalDataPoints], copyHums[totalDataPoints], copyPress[totalDataPoints];
-float adjDP_global[totalDataPoints];    // Shared by MC search passes
-float weights_global[totalDataPoints];  // Shared by MC search passes
-float vTemps_global[totalDataPoints];    // Corresponding temps for correlation
-
 void monteCarloTask(void *parameter) {
   while (true) {
     vTaskDelay(60000 / portTICK_PERIOD_MS);
@@ -292,6 +341,12 @@ void monteCarloTask(void *parameter) {
       memcpy(copyHums, empiricalHumidities, sizeof(copyHums));
       memcpy(copyPress, empiricalPressures, sizeof(copyPress));
       xSemaphoreGive(dataMutex);
+
+      // Pre-calculate raw dew points once to speed up the MC nested loops
+      for (int i = 0; i < totalDataPoints; i++) {
+        float dp = calculateDewPoint(copyTemps[i], copyHums[i]);
+        rawDewPoints[i] = adjustDewPointForPressure(dp, copyPress[i]);
+      }
 
       monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, head);
     }
@@ -315,13 +370,14 @@ void addRealTimeDataPoint(float t, float h, float p, float dp) {
 
 // ── Sensor initialisation ────────────────────────────────────────────────────
 void initializeSensors() {
-  if (!bme.begin(0x76)) {
-    Serial.println("BME280 not found — check wiring!");
-    while (1);
-  }
-  if (!sht4x.begin()) {
-    Serial.println("SHT4x not found — check wiring!");
-    while (1);
+  bool bme_ok = bme.begin(0x76);
+  bool sht_ok = sht4x.begin();
+
+  if (!bme_ok || !sht_ok) {
+    if (!bme_ok) Serial.println("BME280 init failed!");
+    if (!sht_ok) Serial.println("SHT4x init failed!");
+    enterSafeMode("I2C Init Failure");
+    return;
   }
 
   sht4x.setPrecision(SHT4X_HIGH_PRECISION);
@@ -700,8 +756,7 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
         int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
-            float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
-            dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
+            float dp = rawDewPoints[j];
             adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
             weights_global[vp] = weights_full[j];
             vTemps_global[vp]  = empiricalTemps[j];
@@ -730,8 +785,7 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
         int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
-            float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
-            dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
+            float dp = rawDewPoints[j];
             adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
             weights_global[vp] = weights_full[j];
             vTemps_global[vp]  = empiricalTemps[j];
@@ -760,8 +814,7 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
         int vp = 0;
         for (int j = 0; j < n; j++) {
           if (empiricalHumidities[j] < 95.0f) {
-            float dp = calculateDewPoint(empiricalTemps[j], empiricalHumidities[j]);
-            dp = adjustDewPointForPressure(dp, empiricalPressures[j]);
+            float dp = rawDewPoints[j];
             adjDP_global[vp] = removeContaminantEffect(dp, co2, so2, no2, empiricalTemps[j]);
             weights_global[vp] = weights_full[j];
             vTemps_global[vp]  = empiricalTemps[j];
@@ -823,4 +876,55 @@ void saveCalibration(float co2, float so2, float no2) {
   preferences.putFloat("no2", no2);
   preferences.end();
   Serial.println("Calibration saved to NVS.");
+}
+
+bool checkSensorHealth() {
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+
+  // Basic range validation
+  if (t < -40.0f || t > 85.0f) return false;
+  if (h < 0.0f || h > 100.0f) return false;
+
+  // NaN check
+  if (isnan(t) || isnan(h)) return false;
+
+  return true;
+}
+
+void enterSafeMode(const char* reason) {
+  stopCooling();
+  digitalWrite(heaterPin, LOW);
+  Serial.print("CRITICAL: Entering Safe Mode. Reason: ");
+  Serial.println(reason);
+
+  // Broadcast error to dashboard
+  char json[128];
+  snprintf(json, sizeof(json), "{\"error\":\"%s\"}", reason);
+  ws.textAll(json);
+}
+
+void performSelfTest() {
+  Serial.println("--- System Self-Test ---");
+  bool pass = true;
+  if (!checkSensorHealth()) {
+    Serial.println("Sensor Health: FAIL");
+    pass = false;
+  } else {
+    Serial.println("Sensor Health: PASS");
+  }
+
+  float p = bme.readPressure() / 100.0f;
+  if (p < 800.0f || p > 1200.0f) {
+    Serial.print("Pressure check: FAIL ("); Serial.print(p); Serial.println(" hPa)");
+    pass = false;
+  } else {
+    Serial.println("Pressure check: PASS");
+  }
+
+  if (!pass) {
+    enterSafeMode("Self-Test Failed");
+  } else {
+    Serial.println("Self-Test: SUCCESS");
+  }
 }
