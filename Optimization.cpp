@@ -4,7 +4,6 @@
 float empiricalTemperatures[totalDataPoints];
 float empiricalHumidities[totalDataPoints];
 float empiricalPressures[totalDataPoints];
-float empiricalDewPoints[totalDataPoints];
 float rawDewPoints[totalDataPoints];
 float copyTemps[totalDataPoints];
 float copyHums[totalDataPoints];
@@ -25,7 +24,6 @@ void addRealTimeDataPoint(float t, float h, float p, float dp) {
   empiricalTemperatures[dataPointIndex] = t;
   empiricalHumidities[dataPointIndex]   = h;
   empiricalPressures[dataPointIndex]    = p;
-  empiricalDewPoints[dataPointIndex]    = dp;
   dataPointIndex++;
   if (dataPointIndex >= totalDataPoints) {
     dataPointIndex = 0;

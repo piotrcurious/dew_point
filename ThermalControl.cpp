@@ -39,12 +39,8 @@ void controlCoolingPWM(float targetTemperature, float ambientRefTemp) {
 
     int pwmValue = (int)(P + I + D + FF);
 
-    // MOSFET and Supply Safety Throttling
-    float mosfetTemp = readMosfetTemp();
+    // Hardware Safety Throttling
     float supplyV = readSupplyVoltage();
-
-    if (mosfetTemp > 70.0f) pwmValue *= 0.7f;
-    if (mosfetTemp > 85.0f) pwmValue = 0;
     if (supplyV < 10.5f) pwmValue = min(pwmValue, 80);
 
     if (pwmValue > 200 && error > 1.0f) coolingHealth *= 0.999f;
