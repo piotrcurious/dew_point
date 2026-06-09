@@ -5,6 +5,8 @@
 extern float coolingHealth;
 
 void stopCooling() {
+  extern int globalCurrentPWM;
+  globalCurrentPWM = 0;
   analogWrite(coolerPin, 0);
 }
 
@@ -37,34 +39,54 @@ void controlCoolingPWM(float targetTemperature, float ambientRefTemp) {
 
     int pwmValue = (int)(P + I + D + FF);
 
-    // MOSFET and Supply Safety Throttling (Simulated placeholders)
-    float mosfetTemp = ambientRefTemp + (pwmValue / 10.0f); // Proxy for real MOSFET thermistor
-    if (mosfetTemp > 70.0f) pwmValue *= 0.8f;
-    if (mosfetTemp > 90.0f) pwmValue = 0;
+    // MOSFET and Supply Safety Throttling
+    float mosfetTemp = readMosfetTemp();
+    float supplyV = readSupplyVoltage();
+
+    if (mosfetTemp > 70.0f) pwmValue *= 0.7f;
+    if (mosfetTemp > 85.0f) pwmValue = 0;
+    if (supplyV < 10.5f) pwmValue = min(pwmValue, 80);
 
     if (pwmValue > 200 && error > 1.0f) coolingHealth *= 0.999f;
     else if (fabsf(error) < 0.2f) coolingHealth = (coolingHealth * 0.999f) + 0.001f;
 
-    analogWrite(coolerPin, constrain(pwmValue, 0, maxPWM));
+    int finalPWM = constrain(pwmValue, 0, maxPWM);
+    extern int globalCurrentPWM;
+    globalCurrentPWM = finalPWM;
+    analogWrite(coolerPin, finalPWM);
     delay(200);
   }
 }
 
 void createCoolingProfile(float estimatedDewPoint, float ambientRefTemp) {
-  for (int i = 0; i < 5; i++) { // Simplified for modular test
-    float target = estimatedDewPoint + (2 - i);
-    controlCoolingPWM(target, ambientRefTemp);
-    delay(500);
+  float targets[numCoolingPoints];
+  for (int i = 0; i < 10; i++) targets[i] = estimatedDewPoint + (5 - i);
+  float step = 2.0f / (numCoolingPoints - 10);
+  for (int i = 10; i < numCoolingPoints; i++) targets[i] = estimatedDewPoint - 1.0f + (i - 10) * step;
+
+  for (int i = 0; i < numCoolingPoints; i++) {
+    controlCoolingPWM(targets[i], ambientRefTemp);
+    delay(1000);
+
+    float t = bme.readTemperature(), h = bme.readHumidity(), p = bme.readPressure() / 100.0f;
+    float dp = adjustDewPointForPressure(calculateDewPoint(t, h), p);
+    addRealTimeDataPoint(t, h, p, dp);
+
+    Serial.print("Cooling ["); Serial.print(i + 1); Serial.print("/"); Serial.print(numCoolingPoints);
+    Serial.print("] T="); Serial.print(t); Serial.print(" DP="); Serial.println(dp);
   }
   stopCooling();
 }
 
 void verifyDewPointWithHeatingProfile() {
   sht4x.setHeater(SHT4X_HEATER_MED_100MS);
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < numHeatingPoints; i++) {
     sensors_event_t h, t;
     sht4x.getEvent(&h, &t);
-    delay(100);
+    float p = bme.readPressure() / 100.0f;
+    float dp = calculateDewPoint(t.temperature, h.relative_humidity);
+    addRealTimeDataPoint(t.temperature, h.relative_humidity, p, dp);
+    delay(200);
   }
   sht4x.setHeater(SHT4X_NO_HEATER);
 }

@@ -66,19 +66,23 @@ bool isPointValid(int i, float *temps, float *hums, int n) {
   return true;
 }
 
-void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex, float ambientRefTemp) {
+void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex, float ambientRefTemp, int currentPWM) {
   if (n == 0) return;
   float bestError = 1e6, bestCO2 = currentCO2Factor, bestSO2 = currentSO2Factor, bestNO2 = currentNO2Factor;
 
   auto search = [&](float cS, float cE, float cStep, float sS, float sE, float sStep, float nS, float nE, float nStep) {
     for (float c = cS; c <= cE + 0.001f; c += cStep) {
       for (float s = sS; s <= sE + 0.001f; s += sStep) {
-        for (float no = nS; n <= nE + 0.001f; no += nStep) {
+        for (float no = nS; no <= nE + 0.001f; no += nStep) {
           int vp = 0;
           for (int j = 0; j < n; j++) {
             if (isPointValid(j, empiricalTemps, empiricalHumidities, n)) {
-              adjDP_global[vp] = removeContaminantEffect(rawDewPoints[j], c, s, no, empiricalTemps[j], ambientRefTemp);
-              weights_global[vp] = 1.0f; vTemps_global[vp] = empiricalTemps[j]; vp++;
+              adjDP_global[vp] = removeContaminantEffect(rawDewPoints[j], c, s, no, empiricalTemps[j], ambientRefTemp, currentPWM);
+              // Chronological weighting: more recent points have higher weight
+              int age = (headIndex - 1 - j + n) % n;
+              weights_global[vp] = expf(-0.002f * age);
+              vTemps_global[vp] = empiricalTemps[j];
+              vp++;
             }
           }
           if (vp < 2) continue;

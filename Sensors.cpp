@@ -38,6 +38,23 @@ void performSelfTest() {
   bool pass = checkSensorHealth();
   float p = bme.readPressure() / 100.0f;
   if (p < 800.0f || p > 1200.0f) pass = false;
+
+  float v = readSupplyVoltage();
+  if (v < 9.0f) { Serial.print("Low Voltage: "); Serial.println(v); pass = false; }
+
   if (!pass) enterSafeMode("Self-Test Failed");
   else Serial.println("Self-Test: SUCCESS");
+}
+
+float readMosfetTemp() {
+  int raw = analogRead(mosfetAdcPin);
+  // Simple thermistor conversion (Steinhart-Hart placeholder)
+  float v = (float)raw * 3.3f / 4095.0f;
+  return 25.0f + (v - 1.65f) * 50.0f;
+}
+
+float readSupplyVoltage() {
+  int raw = analogRead(supplyAdcPin);
+  // Voltage divider: (R1+R2)/R2 * ADC_Ref
+  return (float)raw * 3.3f / 4095.0f * (10.0f + 2.2f) / 2.2f;
 }

@@ -3,6 +3,8 @@
 
 #include "config.h"
 
+extern void addRealTimeDataPoint(float t, float h, float p, float dp);
+
 void stopCooling();
 void controlCoolingPWM(float targetTemperature, float ambientRefTemp);
 void createCoolingProfile(float estimatedDewPoint, float ambientRefTemp);

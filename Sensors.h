@@ -11,5 +11,7 @@ extern Adafruit_SHT4x sht4x;
 void initializeSensors();
 bool checkSensorHealth();
 void performSelfTest();
+float readMosfetTemp();
+float readSupplyVoltage();
 
 #endif

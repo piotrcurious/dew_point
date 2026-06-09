@@ -23,6 +23,8 @@ const float no2TempCoeff = 0.08f;
 // ── PWM / pin settings ───────────────────────────────────────────────────────
 const int   coolerPin         = 16;
 const int   heaterPin         = 17;
+const int   mosfetAdcPin      = 34; // Example ADC pin for thermistor
+const int   supplyAdcPin      = 35; // Example ADC pin for supply voltage
 const int   maxPWM            = 255;
 const int   minPWM            = 50;
 const int   numCoolingPoints  = 100;
