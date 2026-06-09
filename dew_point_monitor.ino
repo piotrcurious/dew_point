@@ -13,6 +13,7 @@ Preferences preferences;
 float filteredT = 25.0f, filteredH = 50.0f, filteredP = 1013.25f;
 float currentCO2Factor = 1.0f, currentSO2Factor = 1.0f, currentNO2Factor = 1.0f;
 float currentConfidence = 0.0f, coolingHealth = 1.0f, ambientRefTemp = 25.0f;
+int globalCurrentPWM = 0;
 SemaphoreHandle_t dataMutex, factorMutex;
 
 AsyncWebServer server(80);
@@ -76,7 +77,16 @@ void monteCarloTask(void *parameter) {
         float dp = calculateDewPoint(copyTemps[i], copyHums[i]);
         rawDewPoints[i] = adjustDewPointForPressure(dp, copyPress[i]);
       }
-      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, dataPointIndex, ambientRefTemp);
+      // Get current PWM as proxy for airflow during simulation
+      int lastPWM = 0;
+      xSemaphoreTake(factorMutex, portMAX_DELAY);
+      // We'll need a global or way to track current PWM safely.
+      // For now, let's assume we read the pin or keep a global.
+      extern int globalCurrentPWM;
+      lastPWM = globalCurrentPWM;
+      xSemaphoreGive(factorMutex);
+
+      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, dataPointIndex, ambientRefTemp, lastPWM);
     }
   }
 }
@@ -121,6 +131,10 @@ const char* htmlContent = R"rawliteral(
             <h1>System</h1>
             <div class="data-row"><span class="label">Fit Conf.</span><span class="value" id="val-conf">--</span><span class="unit">%</span></div>
             <div class="data-row"><span class="label">Cooling Health</span><span class="value" id="val-health">--</span><span class="unit">%</span></div>
+            <hr>
+            <h1>Hardware</h1>
+            <div class="data-row"><span class="label">MOSFET</span><span class="value" id="val-mtemp">--</span><span class="unit">°C</span></div>
+            <div class="data-row"><span class="label">Supply</span><span class="value" id="val-svolt">--</span><span class="unit">V</span></div>
             <hr>
             <h1>Diagnostics</h1>
             <div class="data-row"><span class="label">Free Heap</span><span class="value" id="val-heap">--</span><span class="unit">bytes</span></div>
@@ -183,6 +197,8 @@ const char* htmlContent = R"rawliteral(
             document.getElementById('val-cdp').innerText = data.cdp.toFixed(2);
             document.getElementById('val-conf').innerText = (data.conf * 100).toFixed(1);
             document.getElementById('val-health').innerText = (data.health * 100).toFixed(1);
+            document.getElementById('val-mtemp').innerText = data.mTemp.toFixed(1);
+            document.getElementById('val-svolt').innerText = data.sVolt.toFixed(2);
             document.getElementById('val-heap').innerText = data.heap;
             document.getElementById('val-uptime').innerText = data.uptime;
 
@@ -238,9 +254,20 @@ void setup() {
   dataMutex = xSemaphoreCreateMutex();
   factorMutex = xSemaphoreCreateMutex();
   ambientRefTemp = bme.readTemperature();
-  float dp = calculateDewPoint(ambientRefTemp, bme.readHumidity());
-  createCoolingProfile(dp, ambientRefTemp);
+  float dp_est = calculateDewPoint(ambientRefTemp, bme.readHumidity());
+  createCoolingProfile(dp_est, ambientRefTemp);
   verifyDewPointWithHeatingProfile();
+
+  if (dataPointIndex > 1) {
+    // Populate rawDewPoints before initial simulation
+    for (int i = 0; i < dataPointIndex; i++) {
+        float dp = calculateDewPoint(empiricalTemperatures[i], empiricalHumidities[i]);
+        rawDewPoints[i] = adjustDewPointForPressure(dp, empiricalPressures[i]);
+    }
+    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex, dataPointIndex, ambientRefTemp, globalCurrentPWM);
+    if (dataPointIndex >= totalDataPoints) bufferFull = true;
+  }
+
   xTaskCreatePinnedToCore(monteCarloTask, "MCTask", 10000, NULL, 1, NULL, 1);
 }
 
@@ -256,14 +283,16 @@ void loop() {
   xSemaphoreTake(factorMutex, portMAX_DELAY);
   cCO2 = currentCO2Factor; cSO2 = currentSO2Factor; cNO2 = currentNO2Factor;
   xSemaphoreGive(factorMutex);
-  float cdp = removeContaminantEffect(dp, cCO2, cSO2, cNO2, filteredT, ambientRefTemp);
+  float cdp = removeContaminantEffect(dp, cCO2, cSO2, cNO2, filteredT, ambientRefTemp, globalCurrentPWM);
 
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t uptime = millis() / 1000;
+  float mTemp = readMosfetTemp();
+  float sVolt = readSupplyVoltage();
 
-  char json[384];
-  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f,\"conf\":%.3f,\"health\":%.3f,\"heap\":%u,\"uptime\":%u}",
-           dp, cdp, cCO2, cSO2, cNO2, filteredT, filteredH, currentConfidence, coolingHealth, freeHeap, uptime);
+  char json[512];
+  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f,\"conf\":%.3f,\"health\":%.3f,\"heap\":%u,\"uptime\":%u,\"mTemp\":%.1f,\"sVolt\":%.2f}",
+           dp, cdp, cCO2, cSO2, cNO2, filteredT, filteredH, currentConfidence, coolingHealth, freeHeap, uptime, mTemp, sVolt);
   ws.textAll(json);
   delay(2000);
 }
