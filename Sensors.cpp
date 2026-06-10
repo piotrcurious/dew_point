@@ -1,4 +1,5 @@
 #include "Sensors.h"
+#include <cmath>
 
 Adafruit_BME280 bme;
 Adafruit_SHT4x sht4x;
