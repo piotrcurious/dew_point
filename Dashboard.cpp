@@ -55,6 +55,7 @@ const char* htmlContent = R"rawliteral(
             <h1>Diagnostics</h1>
             <div class="data-row"><span class="label">Free Heap</span><span class="value" id="val-heap">--</span><span class="unit">bytes</span></div>
             <div class="data-row"><span class="label">Min Heap</span><span class="value" id="val-minheap">--</span><span class="unit">bytes</span></div>
+            <div class="data-row"><span class="label">Last Cal</span><span class="value" id="val-lastcal">--</span><span class="unit">sec ago</span></div>
             <div class="data-row"><span class="label">Uptime</span><span class="value" id="val-uptime">--</span><span class="unit">sec</span></div>
         </div>
 
@@ -118,15 +119,19 @@ const char* htmlContent = R"rawliteral(
             document.getElementById('val-svolt').innerText = data.sVolt.toFixed(2);
             document.getElementById('val-heap').innerText = data.heap;
             document.getElementById('val-minheap').innerText = data.minHeap;
+            document.getElementById('val-lastcal').innerText = data.lastCal;
             document.getElementById('val-uptime').innerText = data.uptime;
 
             for (let i = 0; i < pointsCount - 1; i++) {
                 rawPos[i * 3 + 1] = rawPos[(i + 1) * 3 + 1];
                 corrPos[i * 3 + 1] = corrPos[(i + 1) * 3 + 1];
+                // Ensure X stays fixed and correct for historical points
+                let x = (i / 10.0) - 25.0;
+                rawPos[i * 3] = x; corrPos[i * 3] = x;
             }
-            let x = ((pointsCount - 1) / 10.0) - 25.0;
-            rawPos[(pointsCount - 1) * 3] = x; rawPos[(pointsCount - 1) * 3 + 1] = data.dp - 15;
-            corrPos[(pointsCount - 1) * 3] = x; corrPos[(pointsCount - 1) * 3 + 1] = data.cdp - 15;
+            let xFinal = ((pointsCount - 1) / 10.0) - 25.0;
+            rawPos[(pointsCount - 1) * 3] = xFinal; rawPos[(pointsCount - 1) * 3 + 1] = data.dp - 15;
+            corrPos[(pointsCount - 1) * 3] = xFinal; corrPos[(pointsCount - 1) * 3 + 1] = data.cdp - 15;
             rawGeo.attributes.position.needsUpdate = true; corrGeo.attributes.position.needsUpdate = true;
         }
 
@@ -164,11 +169,12 @@ void initializeDashboard() {
   server.begin();
 }
 
-void broadcastTelemetry(float dp, float cdp, float cCO2, float cSO2, float cNO2, float t, float h, float conf, float health, float bVolt, float sVolt, uint32_t minFreeHeap) {
+void broadcastTelemetry(float dp, float cdp, float cCO2, float cSO2, float cNO2, float t, float h, float conf, float health, float bVolt, float sVolt, uint32_t minFreeHeap, uint32_t lastCal) {
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t uptime = millis() / 1000;
+  uint32_t ago = (lastCal == 0) ? 0 : uptime - lastCal;
   char json[512];
-  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f,\"conf\":%.3f,\"health\":%.3f,\"heap\":%u,\"minHeap\":%u,\"uptime\":%u,\"bVolt\":%.2f,\"sVolt\":%.2f}",
-           dp, cdp, cCO2, cSO2, cNO2, t, h, conf, health, freeHeap, minFreeHeap, uptime, bVolt, sVolt);
+  snprintf(json, sizeof(json), "{\"dp\":%.2f,\"cdp\":%.2f,\"co2\":%.3f,\"so2\":%.3f,\"no2\":%.3f,\"t\":%.2f,\"h\":%.1f,\"conf\":%.3f,\"health\":%.3f,\"heap\":%u,\"minHeap\":%u,\"uptime\":%u,\"bVolt\":%.2f,\"sVolt\":%.2f,\"lastCal\":%u}",
+           dp, cdp, cCO2, cSO2, cNO2, t, h, conf, health, freeHeap, minFreeHeap, uptime, bVolt, sVolt, ago);
   ws.textAll(json);
 }

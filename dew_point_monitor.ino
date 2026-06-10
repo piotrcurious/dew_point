@@ -12,7 +12,7 @@ float filteredT = 25.0f, filteredH = 50.0f, filteredP = 1013.25f;
 float currentCO2Factor = 1.0f, currentSO2Factor = 1.0f, currentNO2Factor = 1.0f;
 float currentConfidence = 0.0f, coolingHealth = 1.0f, ambientRefTemp = 25.0f;
 int globalCurrentPWM = 0;
-uint32_t minHeapSeen = 0xFFFFFFFF;
+uint32_t minHeapSeen = 0xFFFFFFFF, lastCalTime = 0;
 SemaphoreHandle_t dataMutex, factorMutex;
 
 void saveCalibration(float co2, float so2, float no2) {
@@ -41,7 +41,9 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
     if (info->final && info->index == 0 && info->len == len) {
-      char *msg = (char*)malloc(len + 1); memcpy(msg, data, len); msg[len] = '\0';
+      char *msg = (char*)malloc(len + 1);
+      if (!msg) return;
+      memcpy(msg, data, len); msg[len] = '\0';
       auto parseField = [](const char* p, const char* f) -> float {
         const char* s = strstr(p, f); if(!s) return -1.0f;
         s += strlen(f); while(*s && (*s=='\"'||*s==' '||*s==':')) s++;
@@ -75,6 +77,7 @@ void monteCarloTask(void *parameter) {
       lastPWM = globalCurrentPWM;
       xSemaphoreGive(factorMutex);
       monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, dataPointIndex, ambientRefTemp, lastPWM);
+      lastCalTime = millis() / 1000;
     }
   }
 }
@@ -100,6 +103,7 @@ void setup() {
         rawDewPoints[i] = adjustDewPointForPressure(dp, empiricalPressures[i]);
     }
     monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex, dataPointIndex, ambientRefTemp, globalCurrentPWM);
+    lastCalTime = millis() / 1000;
     if (dataPointIndex >= totalDataPoints) bufferFull = true;
   }
 
@@ -123,6 +127,6 @@ void loop() {
   float cdp = removeContaminantEffect(dp, cCO2, cSO2, cNO2, filteredT, ambientRefTemp, globalCurrentPWM);
   uint32_t fh = ESP.getFreeHeap();
   if (fh < minHeapSeen) minHeapSeen = fh;
-  broadcastTelemetry(dp, cdp, cCO2, cSO2, cNO2, filteredT, filteredH, currentConfidence, coolingHealth, readBatteryVoltage(), readSupplyVoltage(), minHeapSeen);
+  broadcastTelemetry(dp, cdp, cCO2, cSO2, cNO2, filteredT, filteredH, currentConfidence, coolingHealth, readBatteryVoltage(), readSupplyVoltage(), minHeapSeen, lastCalTime);
   delay(2000);
 }
