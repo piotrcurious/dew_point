@@ -22,24 +22,21 @@ float getTempAdsorptionFactor(float temperature, float ambientRefTemp, int curre
 }
 
 float adjustDewPointForCO2(float dewPoint, float concentration, float temperature, float ambientRefTemp, int currentPWM) {
-  float adj = co2Factor * logf(1.0f + co2NonlinearCoeff * concentration) * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM);
-  return dewPoint + dewPoint * adj;
+  return dewPoint * (1.0f + co2Factor * logf(1.0f + co2NonlinearCoeff * concentration) * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM));
 }
 
 float adjustDewPointForSO2(float dewPoint, float concentration, float temperature, float ambientRefTemp, int currentPWM) {
-  float adj = so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM);
-  return dewPoint + dewPoint * adj;
+  return dewPoint * (1.0f + so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM));
 }
 
 float adjustDewPointForNO2(float dewPoint, float concentration, float temperature, float ambientRefTemp, int currentPWM) {
-  float adj = no2Factor * (expf(no2NonlinearCoeff * concentration) - 1.0f) * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM);
-  return dewPoint + dewPoint * adj;
+  return dewPoint * (1.0f + no2Factor * (expf(no2NonlinearCoeff * concentration) - 1.0f) * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM));
 }
 
 float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature, float ambientRefTemp, int currentPWM) {
   float f = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM);
-  float adj_co2 = co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * f;
-  float adj_so2 = so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * f;
-  float adj_no2 = no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * f;
-  return measuredDewPoint / (1.0f + adj_co2 + adj_so2 + adj_no2);
+  float c = 1.0f + co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * f;
+  float s = 1.0f + so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * f;
+  float n = 1.0f + no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * f;
+  return measuredDewPoint / (c * s * n);
 }
