@@ -58,10 +58,12 @@ float computeTemperatureCorrelation(float *dewPoints, float *temps, float *weigh
 }
 
 bool isPointValid(int i, float *temps, float *hums, int n) {
-  if (hums[i] > 95.0f || hums[i] < 5.0f) return false;
+  if (hums[i] > 98.0f || hums[i] < 2.0f) return false; // Increased range for extreme environments
   if (i > 0) {
     float dT = fabsf(temps[i] - temps[i-1]);
-    if (dT > 5.0f) return false; // Thermal gradient too high (noise)
+    float dH = fabsf(hums[i] - hums[i-1]);
+    // Reject if instantaneous change is physically impossible (signal spikes)
+    if (dT > 8.0f || dH > 15.0f) return false;
   }
   return true;
 }
@@ -96,20 +98,24 @@ float objectiveFunction(float c, float s, float no, float *temps, float *hums, i
 
 void nelderMead(float *bestC, float *bestS, float *bestN, float *bestErr, float *temps, float *hums, int n, float ambientRefTemp, int currentPWM) {
   SimplexPoint s[4];
-  // Initial simplex centered around coarse best
+  // Initial simplex centered around coarse best.
+  // Step size 1.0 is aggressive enough for grid pass 1.0 but small enough for local refinement.
+  float step = 1.0f;
   s[0].p[0] = *bestC; s[0].p[1] = *bestS; s[0].p[2] = *bestN;
-  s[1].p[0] = *bestC + 2.0f; s[1].p[1] = *bestS; s[1].p[2] = *bestN;
-  s[2].p[0] = *bestC; s[2].p[1] = *bestS + 2.0f; s[2].p[2] = *bestN;
-  s[3].p[0] = *bestC; s[3].p[1] = *bestS; s[3].p[2] = *bestN + 2.0f;
+  s[1].p[0] = *bestC + step; s[1].p[1] = *bestS; s[1].p[2] = *bestN;
+  s[2].p[0] = *bestC; s[2].p[1] = *bestS + step; s[2].p[2] = *bestN;
+  s[3].p[0] = *bestC; s[3].p[1] = *bestS; s[3].p[2] = *bestN + step;
 
   for (int i = 0; i < 4; i++) s[i].f = objectiveFunction(s[i].p[0], s[i].p[1], s[i].p[2], temps, hums, n, ambientRefTemp, currentPWM);
 
-  for (int iter = 0; iter < 60; iter++) {
+  const int maxIter = 80;
+  for (int iter = 0; iter < maxIter; iter++) {
     // Sort
     std::sort(s, s + 4, [](const SimplexPoint &a, const SimplexPoint &b) { return a.f < b.f; });
 
-    // Termination check
-    if (fabsf(s[3].f - s[0].f) < 0.0001f) break;
+    // Termination check: value difference and coordinate diameter
+    float coordDiff = fabsf(s[3].p[0] - s[0].p[0]) + fabsf(s[3].p[1] - s[0].p[1]) + fabsf(s[3].p[2] - s[0].p[2]);
+    if (fabsf(s[3].f - s[0].f) < 0.00001f && coordDiff < 0.001f) break;
 
     // Centroid of best 3
     float mid[3] = {0, 0, 0};
