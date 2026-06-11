@@ -51,9 +51,11 @@ void performSelfTest() {
 }
 
 float readBatteryVoltage() {
-  int raw = analogRead(batteryAdcPin);
+  long sum = 0;
+  for (int i = 0; i < 16; i++) sum += analogRead(batteryAdcPin);
+  float raw = (float)sum / 16.0f;
   // Voltage divider: (R1+R2)/R2 * ADC_Ref. Assuming same as supply for now.
-  return (float)raw * 3.3f / 4095.0f * (10.0f + 2.2f) / 2.2f;
+  return raw * 3.3f / 4095.0f * (10.0f + 2.2f) / 2.2f;
 }
 
 float readSupplyVoltage() {

@@ -57,12 +57,14 @@ float computeTemperatureCorrelation(float *dewPoints, float *temps, float *weigh
   return fabsf(num / sqrtf(dt * ddp));
 }
 
-bool isPointValid(int i, float *temps, float *hums, int n) {
-  if (hums[i] > 98.0f || hums[i] < 2.0f) return false; // Increased range for extreme environments
-  if (i > 0) {
-    float dT = fabsf(temps[i] - temps[i-1]);
-    float dH = fabsf(hums[i] - hums[i-1]);
-    // Reject if instantaneous change is physically impossible (signal spikes)
+bool isPointValid(int i, float *temps, float *hums, int n, int headIndex) {
+  if (hums[i] > 98.0f || hums[i] < 2.0f) return false;
+  // Use headIndex to find the chronologically previous point in the circular buffer
+  int prev = (i - 1 + n) % n;
+  // Only check gradient if we aren't at the very first data point ever collected
+  if (n == totalDataPoints || i != (headIndex % n)) {
+    float dT = fabsf(temps[i] - temps[prev]);
+    float dH = fabsf(hums[i] - hums[prev]);
     if (dT > 8.0f || dH > 15.0f) return false;
   }
   return true;
@@ -73,13 +75,13 @@ struct SimplexPoint {
   float f;    // Cost
 };
 
-float objectiveFunction(float c, float s, float no, float *temps, float *hums, int n, float ambientRefTemp, int currentPWM) {
+float objectiveFunction(float c, float s, float no, float *temps, float *hums, int n, int headIndex, float ambientRefTemp, int currentPWM) {
   int vp = 0;
   for (int j = 0; j < n; j++) {
-    if (isPointValid(j, temps, hums, n)) {
+    if (isPointValid(j, temps, hums, n, headIndex)) {
       adjDP_global[vp] = removeContaminantEffect(rawDewPoints[j], c, s, no, temps[j], ambientRefTemp, currentPWM);
-      int age = (dataPointIndex > 0) ? (dataPointIndex - 1 - j + n) % n : 0;
-      weights_global[vp] = expf(-0.001f * age); // Slower decay for test stability
+      int age = (headIndex - 1 - j + n) % n;
+      weights_global[vp] = expf(-0.001f * age);
       vTemps_global[vp] = temps[j];
       vp++;
     }
@@ -96,17 +98,15 @@ float objectiveFunction(float c, float s, float no, float *temps, float *hums, i
   return var + (150.0f * corr) + 0.1f * (c + s + no) + penalty;
 }
 
-void nelderMead(float *bestC, float *bestS, float *bestN, float *bestErr, float *temps, float *hums, int n, float ambientRefTemp, int currentPWM) {
+void nelderMead(float *bestC, float *bestS, float *bestN, float *bestErr, float *temps, float *hums, int n, int headIndex, float ambientRefTemp, int currentPWM) {
   SimplexPoint s[4];
-  // Initial simplex centered around coarse best.
-  // Step size 1.0 is aggressive enough for grid pass 1.0 but small enough for local refinement.
   float step = 1.0f;
   s[0].p[0] = *bestC; s[0].p[1] = *bestS; s[0].p[2] = *bestN;
   s[1].p[0] = *bestC + step; s[1].p[1] = *bestS; s[1].p[2] = *bestN;
   s[2].p[0] = *bestC; s[2].p[1] = *bestS + step; s[2].p[2] = *bestN;
   s[3].p[0] = *bestC; s[3].p[1] = *bestS; s[3].p[2] = *bestN + step;
 
-  for (int i = 0; i < 4; i++) s[i].f = objectiveFunction(s[i].p[0], s[i].p[1], s[i].p[2], temps, hums, n, ambientRefTemp, currentPWM);
+  for (int i = 0; i < 4; i++) s[i].f = objectiveFunction(s[i].p[0], s[i].p[1], s[i].p[2], temps, hums, n, headIndex, ambientRefTemp, currentPWM);
 
   const int maxIter = 80;
   for (int iter = 0; iter < maxIter; iter++) {
@@ -124,7 +124,7 @@ void nelderMead(float *bestC, float *bestS, float *bestN, float *bestErr, float 
     // Reflection
     float ref[3];
     for (int i = 0; i < 3; i++) ref[i] = mid[i] + 1.0f * (mid[i] - s[3].p[i]);
-    float refF = objectiveFunction(ref[0], ref[1], ref[2], temps, hums, n, ambientRefTemp, currentPWM);
+    float refF = objectiveFunction(ref[0], ref[1], ref[2], temps, hums, n, headIndex, ambientRefTemp, currentPWM);
 
     if (s[0].f <= refF && refF < s[2].f) {
       s[3].p[0] = ref[0]; s[3].p[1] = ref[1]; s[3].p[2] = ref[2]; s[3].f = refF;
@@ -132,20 +132,20 @@ void nelderMead(float *bestC, float *bestS, float *bestN, float *bestErr, float 
       // Expansion
       float exp[3];
       for (int i = 0; i < 3; i++) exp[i] = mid[i] + 2.0f * (ref[i] - mid[i]);
-      float expF = objectiveFunction(exp[0], exp[1], exp[2], temps, hums, n, ambientRefTemp, currentPWM);
+      float expF = objectiveFunction(exp[0], exp[1], exp[2], temps, hums, n, headIndex, ambientRefTemp, currentPWM);
       if (expF < refF) { s[3].p[0] = exp[0]; s[3].p[1] = exp[1]; s[3].p[2] = exp[2]; s[3].f = expF; }
       else { s[3].p[0] = ref[0]; s[3].p[1] = ref[1]; s[3].p[2] = ref[2]; s[3].f = refF; }
     } else {
       // Contraction
       float con[3];
       for (int i = 0; i < 3; i++) con[i] = mid[i] + 0.5f * (s[3].p[i] - mid[i]);
-      float conF = objectiveFunction(con[0], con[1], con[2], temps, hums, n, ambientRefTemp, currentPWM);
+      float conF = objectiveFunction(con[0], con[1], con[2], temps, hums, n, headIndex, ambientRefTemp, currentPWM);
       if (conF < s[3].f) { s[3].p[0] = con[0]; s[3].p[1] = con[1]; s[3].p[2] = con[2]; s[3].f = conF; }
       else {
         // Shrink
         for (int i = 1; i < 4; i++) {
           for (int j = 0; j < 3; j++) s[i].p[j] = s[0].p[j] + 0.5f * (s[i].p[j] - s[0].p[j]);
-          s[i].f = objectiveFunction(s[i].p[0], s[i].p[1], s[i].p[2], temps, hums, n, ambientRefTemp, currentPWM);
+          s[i].f = objectiveFunction(s[i].p[0], s[i].p[1], s[i].p[2], temps, hums, n, headIndex, ambientRefTemp, currentPWM);
         }
       }
     }
@@ -163,9 +163,8 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
         for (float no = nS; no <= nE + 0.001f; no += nStep) {
           int vp = 0;
           for (int j = 0; j < n; j++) {
-            if (isPointValid(j, empiricalTemps, empiricalHumidities, n)) {
+            if (isPointValid(j, empiricalTemps, empiricalHumidities, n, headIndex)) {
               adjDP_global[vp] = removeContaminantEffect(rawDewPoints[j], c, s, no, empiricalTemps[j], ambientRefTemp, currentPWM);
-              // Chronological weighting: more recent points have higher weight
               int age = (headIndex - 1 - j + n) % n;
               weights_global[vp] = expf(-0.002f * age);
               vTemps_global[vp] = empiricalTemps[j];
@@ -186,7 +185,7 @@ void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, flo
   search(0, 5, 1.0f, 0, 5, 1.0f, 0, 5, 1.0f);
 
   // Pass 2: Nelder-Mead Simplex for high-precision refinement
-  nelderMead(&bestCO2, &bestSO2, &bestNO2, &bestError, empiricalTemps, empiricalHumidities, n, ambientRefTemp, currentPWM);
+  nelderMead(&bestCO2, &bestSO2, &bestNO2, &bestError, empiricalTemps, empiricalHumidities, n, headIndex, ambientRefTemp, currentPWM);
 
   float confidence = 1.0f / (1.0f + bestError);
   xSemaphoreTake(factorMutex, portMAX_DELAY);
