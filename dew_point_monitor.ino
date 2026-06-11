@@ -13,6 +13,8 @@ float currentCO2Factor = 1.0f, currentSO2Factor = 1.0f, currentNO2Factor = 1.0f;
 float currentConfidence = 0.0f, coolingHealth = 1.0f, ambientRefTemp = 25.0f;
 int globalCurrentPWM = 0;
 uint32_t minHeapSeen = 0xFFFFFFFF, lastCalTime = 0;
+bool g_isOptimizing = false;
+bool g_forceCal = false;
 SemaphoreHandle_t dataMutex, factorMutex;
 
 void saveCalibration(float co2, float so2, float no2) {
@@ -44,16 +46,21 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
       char *msg = (char*)malloc(len + 1);
       if (!msg) return;
       memcpy(msg, data, len); msg[len] = '\0';
-      auto parseField = [](const char* p, const char* f) -> float {
-        const char* s = strstr(p, f); if(!s) return -1.0f;
-        s += strlen(f); while(*s && (*s=='\"'||*s==' '||*s==':')) s++;
-        return (*s=='\0'||*s==','||*s=='}') ? -1.0f : (float)atof(s);
-      };
-      float f1 = parseField(msg, "\"co2\""), f2 = parseField(msg, "\"so2\""), f3 = parseField(msg, "\"no2\"");
-      xSemaphoreTake(factorMutex, portMAX_DELAY);
-      if (f1 >= 0) currentCO2Factor = f1; if (f2 >= 0) currentSO2Factor = f2; if (f3 >= 0) currentNO2Factor = f3;
-      xSemaphoreGive(factorMutex);
-      if (f1 >= 0 || f2 >= 0 || f3 >= 0) saveCalibration(currentCO2Factor, currentSO2Factor, currentNO2Factor);
+
+      if (strstr(msg, "\"calibrate\"")) {
+          g_forceCal = true;
+      } else {
+          auto parseField = [](const char* p, const char* f) -> float {
+            const char* s = strstr(p, f); if(!s) return -1.0f;
+            s += strlen(f); while(*s && (*s=='\"'||*s==' '||*s==':')) s++;
+            return (*s=='\0'||*s==','||*s=='}') ? -1.0f : (float)atof(s);
+          };
+          float f1 = parseField(msg, "\"co2\""), f2 = parseField(msg, "\"so2\""), f3 = parseField(msg, "\"no2\"");
+          xSemaphoreTake(factorMutex, portMAX_DELAY);
+          if (f1 >= 0) currentCO2Factor = f1; if (f2 >= 0) currentSO2Factor = f2; if (f3 >= 0) currentNO2Factor = f3;
+          xSemaphoreGive(factorMutex);
+          if (f1 >= 0 || f2 >= 0 || f3 >= 0) saveCalibration(currentCO2Factor, currentSO2Factor, currentNO2Factor);
+      }
       free(msg);
     }
   }
@@ -61,9 +68,16 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
 
 void monteCarloTask(void *parameter) {
   while (true) {
-    vTaskDelay(60000 / portTICK_PERIOD_MS);
-    if (bufferFull) {
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    static unsigned long lastRun = 0;
+    bool timeToRun = (millis() - lastRun > 60000);
+
+    if (bufferFull && (timeToRun || g_forceCal)) {
+      g_isOptimizing = true;
+      g_forceCal = false;
+      lastRun = millis();
       xSemaphoreTake(dataMutex, portMAX_DELAY);
+      int head = dataPointIndex;
       memcpy(copyTemps, empiricalTemperatures, totalDataPoints * sizeof(float));
       memcpy(copyHums, empiricalHumidities, totalDataPoints * sizeof(float));
       memcpy(copyPress, empiricalPressures, totalDataPoints * sizeof(float));
@@ -76,8 +90,9 @@ void monteCarloTask(void *parameter) {
       xSemaphoreTake(factorMutex, portMAX_DELAY);
       lastPWM = globalCurrentPWM;
       xSemaphoreGive(factorMutex);
-      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, dataPointIndex, ambientRefTemp, lastPWM);
+      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, head, ambientRefTemp, lastPWM);
       lastCalTime = millis() / 1000;
+      g_isOptimizing = false;
     }
   }
 }
@@ -127,6 +142,6 @@ void loop() {
   float cdp = removeContaminantEffect(dp, cCO2, cSO2, cNO2, filteredT, ambientRefTemp, globalCurrentPWM);
   uint32_t fh = ESP.getFreeHeap();
   if (fh < minHeapSeen) minHeapSeen = fh;
-  broadcastTelemetry(dp, cdp, cCO2, cSO2, cNO2, filteredT, filteredH, currentConfidence, coolingHealth, readBatteryVoltage(), readSupplyVoltage(), minHeapSeen, lastCalTime);
+  broadcastTelemetry(dp, cdp, cCO2, cSO2, cNO2, filteredT, filteredH, currentConfidence, coolingHealth, readBatteryVoltage(), readSupplyVoltage(), minHeapSeen, lastCalTime, g_isOptimizing);
   delay(2000);
 }

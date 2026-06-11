@@ -15,5 +15,6 @@ extern bool  bufferFull;
 
 void addRealTimeDataPoint(float t, float h, float p, float dp);
 void monteCarloSimulation(float *empiricalTemps, float *empiricalHumidities, float *empiricalPressures, int n, int headIndex, float ambientRefTemp, int currentPWM);
+float objectiveFunction(float c, float s, float no, float *temps, float *hums, int n, int headIndex, float ambientRefTemp, int currentPWM);
 
 #endif

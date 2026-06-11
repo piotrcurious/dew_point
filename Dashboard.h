@@ -8,6 +8,6 @@ extern AsyncWebServer server;
 extern AsyncWebSocket ws;
 
 void initializeDashboard();
-void broadcastTelemetry(float dp, float cdp, float cCO2, float cSO2, float cNO2, float t, float h, float conf, float health, float bVolt, float sVolt, uint32_t minFreeHeap, uint32_t lastCal);
+void broadcastTelemetry(float dp, float cdp, float cCO2, float cSO2, float cNO2, float t, float h, float conf, float health, float bVolt, float sVolt, uint32_t minFreeHeap, uint32_t lastCal, bool isOptimizing);
 
 #endif
