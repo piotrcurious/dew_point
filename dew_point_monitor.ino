@@ -104,6 +104,11 @@ void setup() {
   loadCalibration();
   initializeDashboard();
 
+  // Initialize filters with real startup values
+  filteredT = bme.readTemperature();
+  filteredH = bme.readHumidity();
+  filteredP = bme.readPressure() / 100.0f;
+
   dataMutex = xSemaphoreCreateMutex();
   factorMutex = xSemaphoreCreateMutex();
 

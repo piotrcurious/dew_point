@@ -71,7 +71,7 @@ const char* htmlContent = R"rawliteral(
             <input type="number" id="iso2" step="0.01" placeholder="SO2">
             <input type="number" id="ino2" step="0.01" placeholder="NO2">
             <button onclick="updateCal()">Commit Factors</button>
-            <button onclick="requestCal()" style="background:#555; margin-top:5px;">Force Optimize</button>
+            <button id="btn-opt" onclick="requestCal()" style="background:#555; margin-top:5px;">Force Optimize</button>
         </div>
         <div id="status-bar">WebSocket: <span id="ws-status">Disconnected</span> | Standalone Mode v3.1</div>
     </div>
@@ -127,6 +127,8 @@ const char* htmlContent = R"rawliteral(
             document.getElementById('val-uptime').innerText = data.uptime;
             document.getElementById('val-status').innerText = data.optimizing ? "OPTIMIZING" : "IDLE";
             document.getElementById('val-status').style.color = data.optimizing ? "#ffaa00" : "#00ffcc";
+            document.getElementById('btn-opt').disabled = data.optimizing;
+            document.getElementById('btn-opt').style.opacity = data.optimizing ? "0.5" : "1.0";
 
             document.getElementById('cur-co2').innerText = data.co2.toFixed(3);
             document.getElementById('cur-so2').innerText = data.so2.toFixed(3);

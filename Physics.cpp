@@ -8,6 +8,9 @@ float calculateDewPoint(float temperature, float humidity) {
 }
 
 float adjustDewPointForPressure(float dewPoint, float pressure) {
+  // Linear approximation of the pressure correction for Magnus-Tetens.
+  // This is physically sound for the expected range of 900-1100 hPa.
+  // Delta T_dp ~ 0.001 K/hPa is a standard atmospheric approximation.
   return dewPoint + (pressure - 1013.25f) * pressureFactor;
 }
 
