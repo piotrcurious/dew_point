@@ -23,8 +23,14 @@ const float no2TempCoeff = 0.08f;
 // ── PWM / pin settings ───────────────────────────────────────────────────────
 const int   coolerPin         = 16;
 const int   heaterPin         = 17;
-const int   batteryAdcPin     = 34; // Repurposed for battery level
-const int   supplyAdcPin      = 35; // Example ADC pin for supply voltage
+const int   batteryAdcPin     = 34;
+const int   supplyAdcPin      = 35;
+
+// ADC Voltage Divider Ratios ( (R1 + R2) / R2 )
+const float batteryDividerRatio = (10.0f + 2.2f) / 2.2f;
+const float supplyDividerRatio  = (10.0f + 2.2f) / 2.2f;
+const float adcRefVoltage       = 3.3f;
+const int   adcResolution       = 4095;
 const int   maxPWM            = 255;
 const int   minPWM            = 50;
 const int   numCoolingPoints  = 100;

@@ -40,8 +40,13 @@ void controlCoolingPWM(float targetTemperature, float ambientRefTemp) {
     int pwmValue = (int)(P + I + D + FF);
 
     // Hardware Safety Throttling
+    // Gradual throttling to prevent supply oscillation (PD-like behavior)
     float supplyV = readSupplyVoltage();
-    if (supplyV < 10.5f) pwmValue = min(pwmValue, 80);
+    if (supplyV < 11.5f) {
+        float throttle = (supplyV - 10.0f) / (11.5f - 10.0f); // 1.0 at 11.5V, 0.0 at 10.0V
+        throttle = constrain(throttle, 0.0f, 1.0f);
+        pwmValue = (int)((float)pwmValue * throttle);
+    }
 
     if (pwmValue > 200 && error > 1.0f) coolingHealth *= 0.999f;
     else if (fabsf(error) < 0.2f) coolingHealth = (coolingHealth * 0.999f) + 0.001f;
