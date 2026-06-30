@@ -8,17 +8,17 @@ const float A             = 17.27f;
 const float B             = 237.7f;
 const float pressureFactor = 0.001f;   // °C / hPa deviation from std pressure
 
-// ── Non-linear contaminant-gas adjustment factors ────────────────────────────
-const float co2Factor         = 0.025f;   // Logarithmic scale (CO₂)
-const float so2Factor         = 0.08f;    // Polynomial scale  (SO₂)
-const float no2Factor         = 0.05f;    // Exponential scale (NO₂)
+// ── Non-linear contaminant-gas adjustment factors (Energy shift kJ/kg) ───────
+const float co2Factor         = 12.0f;    // Logarithmic scale (CO₂)
+const float so2Factor         = 45.0f;    // Polynomial scale  (SO₂)
+const float no2Factor         = 30.0f;    // Exponential scale (NO₂)
 const float co2NonlinearCoeff = 0.4f;
 const float so2NonlinearCoeff = 0.9f;
 const float no2NonlinearCoeff = 1.2f;
 
-const float co2TempCoeff = 0.02f;
-const float so2TempCoeff = 0.05f;
-const float no2TempCoeff = 0.08f;
+const float co2TempCoeff = 0.015f;
+const float so2TempCoeff = 0.060f;
+const float no2TempCoeff = 0.140f;
 
 // ── PWM / pin settings ───────────────────────────────────────────────────────
 const int   coolerPin         = 16;

@@ -7,39 +7,42 @@ float calculateDewPoint(float temperature, float humidity) {
   return (B * alpha) / (A - alpha);
 }
 
+float calculateEvaporationEnergy(float temperature, float humidity) {
+  // Lv(T) = 2500.8 - 2.36 * T (T in Celsius, L in kJ/kg)
+  return 2500.8f - 2.36f * temperature;
+}
+
 float adjustDewPointForPressure(float dewPoint, float pressure) {
-  // Linear approximation of the pressure correction for Magnus-Tetens.
-  // This is physically sound for the expected range of 900-1100 hPa.
-  // Delta T_dp ~ 0.001 K/hPa is a standard atmospheric approximation.
   return dewPoint + (pressure - 1013.25f) * pressureFactor;
 }
 
-float getTempAdsorptionFactor(float temperature, float ambientRefTemp, int currentPWM) {
+float getTempAdsorptionFactor(float temperature, float ambientRefTemp, int currentPWM, float gasTempCoeff) {
   float deltaT = ambientRefTemp - temperature;
   if (deltaT < 0) deltaT = 0;
 
-  // Airflow is proportional to cooling power (fan linked to PWM)
-  // Higher airflow reduces adsorption concentration at the sensor surface
   float airflowFactor = 1.0f + ((float)currentPWM / 255.0f) * 2.0f;
-  return 1.0f + (0.08f * deltaT) / airflowFactor;
-}
-
-float adjustDewPointForCO2(float dewPoint, float concentration, float temperature, float ambientRefTemp, int currentPWM) {
-  return dewPoint * (1.0f + co2Factor * logf(1.0f + co2NonlinearCoeff * concentration) * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM));
-}
-
-float adjustDewPointForSO2(float dewPoint, float concentration, float temperature, float ambientRefTemp, int currentPWM) {
-  return dewPoint * (1.0f + so2Factor * powf(concentration, 2.0f) * so2NonlinearCoeff * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM));
-}
-
-float adjustDewPointForNO2(float dewPoint, float concentration, float temperature, float ambientRefTemp, int currentPWM) {
-  return dewPoint * (1.0f + no2Factor * (expf(no2NonlinearCoeff * concentration) - 1.0f) * getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM));
+  // Arrhenius-like adsorption model: exp(E_a / RT)
+  return expf((gasTempCoeff * deltaT) / airflowFactor);
 }
 
 float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature, float ambientRefTemp, int currentPWM) {
-  float f = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM);
-  float c = 1.0f + co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * f;
-  float s = 1.0f + so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * f;
-  float n = 1.0f + no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * f;
-  return measuredDewPoint / (c * s * n);
+  float fc = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM, co2TempCoeff);
+  float fs = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM, so2TempCoeff);
+  float fn = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM, no2TempCoeff);
+
+  // Total evaporation energy shift (kJ/kg)
+  float dL = (co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * fc) +
+             (so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * fs) +
+             (no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * fn);
+
+  // Latent heat L in kJ/kg
+  float L = calculateEvaporationEnergy(measuredDewPoint, 100.0f);
+
+  // Clausius-Clapeyron derived shift:
+  // dT = (Rv * T^2 / L) * (dL / L)
+  // Rv for water vapor = 0.4615 kJ/(kg*K)
+  float T_k = measuredDewPoint + 273.15f;
+  float shift = (0.4615f * T_k * T_k / L) * (dL / L);
+
+  return measuredDewPoint - shift;
 }
