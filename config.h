@@ -8,17 +8,23 @@ const float A             = 17.27f;
 const float B             = 237.7f;
 const float pressureFactor = 0.001f;   // °C / hPa deviation from std pressure
 
-// ── Non-linear contaminant-gas adjustment factors (Energy shift kJ/kg) ───────
-const float co2Factor         = 12.0f;    // Logarithmic scale (CO₂)
-const float so2Factor         = 45.0f;    // Polynomial scale  (SO₂)
-const float no2Factor         = 30.0f;    // Exponential scale (NO₂)
-const float co2NonlinearCoeff = 0.4f;
-const float so2NonlinearCoeff = 0.9f;
-const float no2NonlinearCoeff = 1.2f;
+// ── Non-linear contaminant-gas adjustment factors ────────────────────────────
+// Goals:
+// 1. Normalized so dev=1.0 => dL ~ 20 kJ/kg at dT=15, flow=1.5
+// 2. High mathematical contrast (Log vs Exp vs Power)
 
-const float co2TempCoeff = 0.015f;
-const float so2TempCoeff = 0.060f;
-const float no2TempCoeff = 0.140f;
+const float co2Factor         = 18.0f;
+const float so2Factor         = 13.0f;
+const float no2Factor         = 0.35f;
+
+const float co2NonlinearCoeff = 0.5f;
+const float so2NonlinearCoeff = 0.9f;
+const float no2NonlinearCoeff = 1.0f;
+
+// Gas specific temperature-signature coefficients
+const float co2TempCoeff = 3.0f;    // Log(1 + 3*dT/flow)
+const float so2TempCoeff = 0.12f;   // Exp(0.12*dT/flow) - 1
+const float no2TempCoeff = 0.8f;    // (1 + 0.8*dT/flow)^1.5
 
 // ── PWM / pin settings ───────────────────────────────────────────────────────
 const int   coolerPin         = 16;

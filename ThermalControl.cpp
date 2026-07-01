@@ -3,9 +3,9 @@
 #include "Physics.h"
 
 extern float coolingHealth;
+extern int globalCurrentPWM;
 
 void stopCooling() {
-  extern int globalCurrentPWM;
   globalCurrentPWM = 0;
   analogWrite(coolerPin, 0);
 }
@@ -40,10 +40,9 @@ void controlCoolingPWM(float targetTemperature, float ambientRefTemp) {
     int pwmValue = (int)(P + I + D + FF);
 
     // Hardware Safety Throttling
-    // Gradual throttling to prevent supply oscillation (PD-like behavior)
     float supplyV = readSupplyVoltage();
     if (supplyV < 11.5f) {
-        float throttle = (supplyV - 10.0f) / (11.5f - 10.0f); // 1.0 at 11.5V, 0.0 at 10.0V
+        float throttle = (supplyV - 10.0f) / (11.5f - 10.0f);
         throttle = constrain(throttle, 0.0f, 1.0f);
         pwmValue = (int)((float)pwmValue * throttle);
     }
@@ -52,7 +51,6 @@ void controlCoolingPWM(float targetTemperature, float ambientRefTemp) {
     else if (fabsf(error) < 0.2f) coolingHealth = (coolingHealth * 0.999f) + 0.001f;
 
     int finalPWM = constrain(pwmValue, 0, maxPWM);
-    extern int globalCurrentPWM;
     globalCurrentPWM = finalPWM;
     analogWrite(coolerPin, finalPWM);
     delay(200);
@@ -71,7 +69,7 @@ void createCoolingProfile(float estimatedDewPoint, float ambientRefTemp) {
 
     float t = bme.readTemperature(), h = bme.readHumidity(), p = bme.readPressure() / 100.0f;
     float dp = adjustDewPointForPressure(calculateDewPoint(t, h), p);
-    addRealTimeDataPoint(t, h, p, dp);
+    addRealTimeDataPoint(t, h, p, dp, globalCurrentPWM);
 
     Serial.print("Cooling ["); Serial.print(i + 1); Serial.print("/"); Serial.print(numCoolingPoints);
     Serial.print("] T="); Serial.print(t); Serial.print(" DP="); Serial.println(dp);
@@ -86,7 +84,7 @@ void verifyDewPointWithHeatingProfile() {
     sht4x.getEvent(&h, &t);
     float p = bme.readPressure() / 100.0f;
     float dp = calculateDewPoint(t.temperature, h.relative_humidity);
-    addRealTimeDataPoint(t.temperature, h.relative_humidity, p, dp);
+    addRealTimeDataPoint(t.temperature, h.relative_humidity, p, dp, globalCurrentPWM);
     delay(200);
   }
   sht4x.setHeater(SHT4X_NO_HEATER);

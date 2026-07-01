@@ -3,7 +3,7 @@
 
 #include "config.h"
 
-extern void addRealTimeDataPoint(float t, float h, float p, float dp);
+extern void addRealTimeDataPoint(float t, float h, float p, float dp, int pwm);
 
 void stopCooling();
 void controlCoolingPWM(float targetTemperature, float ambientRefTemp);

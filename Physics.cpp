@@ -8,7 +8,6 @@ float calculateDewPoint(float temperature, float humidity) {
 }
 
 float calculateEvaporationEnergy(float temperature, float humidity) {
-  // Lv(T) = 2500.8 - 2.36 * T (T in Celsius, L in kJ/kg)
   return 2500.8f - 2.36f * temperature;
 }
 
@@ -19,30 +18,37 @@ float adjustDewPointForPressure(float dewPoint, float pressure) {
 float getTempAdsorptionFactor(float temperature, float ambientRefTemp, int currentPWM, float gasTempCoeff) {
   float deltaT = ambientRefTemp - temperature;
   if (deltaT < 0) deltaT = 0;
-
   float airflowFactor = 1.0f + ((float)currentPWM / 255.0f) * 2.0f;
-  // Arrhenius-like adsorption model: exp(E_a / RT)
-  return expf((gasTempCoeff * deltaT) / airflowFactor);
+  return (deltaT / airflowFactor);
 }
 
 float removeContaminantEffect(float measuredDewPoint, float co2Dev, float so2Dev, float no2Dev, float temperature, float ambientRefTemp, int currentPWM) {
-  float fc = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM, co2TempCoeff);
-  float fs = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM, so2TempCoeff);
-  float fn = getTempAdsorptionFactor(temperature, ambientRefTemp, currentPWM, no2TempCoeff);
+  float dT = ambientRefTemp - temperature;
+  if (dT < 0) dT = 0;
+  float flow = 1.0f + ((float)currentPWM / 255.0f) * 2.0f;
 
-  // Total evaporation energy shift (kJ/kg)
-  float dL = (co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * fc) +
-             (so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * fs) +
-             (no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * fn);
+  // Differentiated Models for high contrast signatures:
 
-  // Latent heat L in kJ/kg
-  float L = calculateEvaporationEnergy(measuredDewPoint, 100.0f);
+  // 1. CO2: Logarithmic Surface Saturation
+  // Signature: Slow rise, flattens out quickly
+  float sigCO2 = co2Factor * logf(1.0f + co2NonlinearCoeff * co2Dev) * logf(1.0f + co2TempCoeff * dT / flow);
 
-  // Clausius-Clapeyron derived shift:
-  // dT = (Rv * T^2 / L) * (dL / L)
-  // Rv for water vapor = 0.4615 kJ/(kg*K)
-  float T_k = measuredDewPoint + 273.15f;
-  float shift = (0.4615f * T_k * T_k / L) * (dL / L);
+  // 2. SO2: Arrhenius Energetic Adsorption
+  // Signature: Standard exponential rise
+  float sigSO2 = so2Factor * powf(so2Dev, 2.0f) * so2NonlinearCoeff * (expf(so2TempCoeff * dT / flow) - 1.0f);
 
-  return measuredDewPoint - shift;
+  // 3. NO2: Power-law Multi-layer
+  // Signature: Accelerating rise (high curvature)
+  float sigNO2 = no2Factor * (expf(no2NonlinearCoeff * no2Dev) - 1.0f) * powf(1.0f + no2TempCoeff * dT / flow, 1.5f);
+
+  float dL = sigCO2 + sigSO2 + sigNO2;
+
+  float L = calculateEvaporationEnergy(temperature, 100.0f);
+  float T_k = temperature + 273.15f;
+  float d_alpha = dL / (0.4615f * T_k);
+
+  float alpha_meas = (A * measuredDewPoint) / (B + measuredDewPoint);
+  float alpha_corr = alpha_meas - d_alpha;
+
+  return (B * alpha_corr) / (A - alpha_corr);
 }
