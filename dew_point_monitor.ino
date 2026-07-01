@@ -81,16 +81,13 @@ void monteCarloTask(void *parameter) {
       memcpy(copyTemps, empiricalTemperatures, totalDataPoints * sizeof(float));
       memcpy(copyHums, empiricalHumidities, totalDataPoints * sizeof(float));
       memcpy(copyPress, empiricalPressures, totalDataPoints * sizeof(float));
+      memcpy(copyPWMs, empiricalPWMs, totalDataPoints * sizeof(int));
       xSemaphoreGive(dataMutex);
       for (int i = 0; i < totalDataPoints; i++) {
         float dp = calculateDewPoint(copyTemps[i], copyHums[i]);
         rawDewPoints[i] = adjustDewPointForPressure(dp, copyPress[i]);
       }
-      int lastPWM = 0;
-      xSemaphoreTake(factorMutex, portMAX_DELAY);
-      lastPWM = globalCurrentPWM;
-      xSemaphoreGive(factorMutex);
-      monteCarloSimulation(copyTemps, copyHums, copyPress, totalDataPoints, head, ambientRefTemp, lastPWM);
+      monteCarloSimulation(copyTemps, copyHums, copyPress, copyPWMs, totalDataPoints, head, ambientRefTemp);
       lastCalTime = millis() / 1000;
       g_isOptimizing = false;
     }
@@ -122,7 +119,7 @@ void setup() {
         float dp = calculateDewPoint(empiricalTemperatures[i], empiricalHumidities[i]);
         rawDewPoints[i] = adjustDewPointForPressure(dp, empiricalPressures[i]);
     }
-    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, dataPointIndex, dataPointIndex, ambientRefTemp, globalCurrentPWM);
+    monteCarloSimulation(empiricalTemperatures, empiricalHumidities, empiricalPressures, empiricalPWMs, dataPointIndex, dataPointIndex, ambientRefTemp);
     lastCalTime = millis() / 1000;
     if (dataPointIndex >= totalDataPoints) bufferFull = true;
   }
@@ -137,7 +134,7 @@ void loop() {
   filteredH = (emaAlphaH*rh)+(1-emaAlphaH)*filteredH;
   filteredP = (emaAlphaP*rp)+(1-emaAlphaP)*filteredP;
   float dp = adjustDewPointForPressure(calculateDewPoint(filteredT, filteredH), filteredP);
-  addRealTimeDataPoint(filteredT, filteredH, filteredP, dp);
+  addRealTimeDataPoint(filteredT, filteredH, filteredP, dp, globalCurrentPWM);
 
   float cCO2, cSO2, cNO2;
   xSemaphoreTake(factorMutex, portMAX_DELAY);
